@@ -1,0 +1,1518 @@
+---
+title: "Discrete-event simulation of ambulance handover queues"
+author: "Andrew Jones"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Run times
+# The full run (50 baseline replications, 12 sensitivity scenarios x 8
+# replications, 10 stress replications) takes hours. Results are cached in
+# saved/ and read back on later knits.
+#   DES_QUICK=1  runs 3 / 2 / 2 replications into saved_quick/ for a check
+#   DES_RERUN=1  ignores the cache and runs the simulations again
+quick <- nzchar(Sys.getenv("DES_QUICK"))
+rerun <- nzchar(Sys.getenv("DES_RERUN"))
+n_rep_base   <- if (quick) 3 else 50
+n_rep_stress <- if (quick) 2 else 10
+n_rep_sens   <- if (quick) 2 else 8
+
+cache_dir <- if (quick) "saved_quick" else "saved"
+dir.create(cache_dir, showWarnings = FALSE)
+
+# Run expr and save the result, or read it back if it is already saved
+cached <- function(file, expr) {
+  path <- file.path(cache_dir, file)
+  if (file.exists(path) && !rerun) return(readRDS(path))
+  x <- expr
+  saveRDS(x, path)
+  x
+}
+```
+
+# 1. Libraries and data load
+
+```{r libs}
+pkgs <- c("simmer", "dplyr", "tidyr", "ggplot2", "purrr", "tibble",
+          "patchwork", "readxl", "scales")
+to_install <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+if (length(to_install)) install.packages(to_install)
+
+library(simmer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(tibble)
+library(patchwork)
+library(readxl)
+library(scales)
+
+set.seed(4001)
+```
+
+```{r load-excel}
+# NHS England time-of-day ambulance attendance file (see data/README.md)
+nhs_file <- "../data/raw/NHS_Time_of_day_ambulance_distribution.xlsx"
+
+amb_xlsx <- read_excel(
+  nhs_file,
+  sheet = "Time of day distribution",
+  col_names = FALSE
+)
+
+hour_names <- sprintf("%02d:00", 0:23)
+
+ambulance_rows <- amb_xlsx %>%
+  dplyr::filter(...2 == "Number of A&E attendances where patient arrived by ambulance") %>%
+  dplyr::select(...1, ...3:...26)
+
+colnames(ambulance_rows) <- c("day", hour_names)
+
+day_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+ambulance_rows <- ambulance_rows %>%
+  dplyr::mutate(day = factor(day, levels = day_order)) %>%
+  dplyr::arrange(day)
+
+ambulance_rows
+```
+
+# 2. Global simulation settings
+
+```{r sim-settings}
+sim_days     <- 60                
+sim_horizon  <- sim_days * 24 * 60       
+warm_up      <- 14 * 24 * 60             
+```
+
+# 3. Service-time distributions (simplified: mean + CV)
+
+I reparameterise all job-cycle distributions using mean and coefficient
+of variation (CV). For a Gamma(shape = k, scale = theta):
+  mean = k * theta and SD = theta * sqrt(k), so CV = 1/sqrt(k).
+Hence shape = 1 / CV^2 and scale = mean * CV^2.
+
+This lets me specify each component by its clinical mean (minutes) and
+a single spread parameter (CV), which is both easier to defend and
+easier to tune. Means are centred on Northern Ireland / UK ambulance
+benchmarks; scene times now decrease monotonically from C1 to C4 to
+reflect that higher-acuity cases require longer on-scene interventions
+(CPR, ALS, stabilisation).
+
+```{r service-times}
+# Helper: sample once from a Gamma with chosen shape k and target mean mu.
+# Under Gamma(shape = k, scale = theta):
+#   mean     = k * theta
+#   variance = k * theta^2
+# So setting theta = mu / k gives a Gamma with the target mean while
+# letting shape k control how concentrated the distribution is (larger
+# k => tighter around the mean; k = 1 is exponential).
+rgamma_mean <- function(mean, shape) {
+  scale <- mean / shape
+  rgamma(1, shape = shape, scale = scale)
+}
+
+# Job-cycle means (minutes) and gamma shape parameters, by category.
+# Shape values reflect empirical spread for each activity:
+#   shape = 4  --> high variability (travel, transport: geography-driven)
+#   shape = 6  --> moderate (scene time, clinical handover)
+#   shape = 10 --> low variability (mobilisation, clearance)
+# Smaller shape = wider spread; larger shape = tighter around the mean.
+
+job_params <- tibble::tribble(
+  ~component,    ~C1,  ~C2,  ~C3,  ~C4,  ~shape,
+  "mobilise",     1.5,  1.5,  1.5,  1.5, 10,
+  "travel",       7.0, 16.0, 20.0, 22.0,  4,
+  "scene",       35.0, 28.0, 22.0, 18.0,  6,
+  "transport",    7.0, 16.0, 20.0, 22.0,  4,
+  "handover",    17.0, 15.0, 13.0, 12.0,  6,
+  "clear",        6.0,  6.0,  6.0,  6.0, 10
+)
+
+# Uniform samplers (mobilise, clear) 
+make_uniform_sampler <- function(component) {
+  row <- job_params[job_params$component == component, ]
+  mean_val <- row$C1
+  shape    <- row$shape
+  function() rgamma_mean(mean_val, shape)
+}
+
+# Category samplers 
+make_cat_sampler <- function(component) {
+  row <- job_params[job_params$component == component, ]
+  shape <- row$shape
+  function(cat) {
+    mean_val <- row[[cat]]
+    rgamma_mean(mean_val, shape)
+  }
+}
+
+mobilise_time   <- make_uniform_sampler("mobilise")
+clear_time      <- make_uniform_sampler("clear")
+travel_to_scene <- make_cat_sampler("travel")
+scene_time      <- make_cat_sampler("scene")
+transport_time  <- make_cat_sampler("transport")
+clinical_handover_time <- make_cat_sampler("handover")
+```
+
+# 4. Handover
+
+```{r handover-params}
+use_handover_queue <- TRUE
+handover_capacity  <- 5
+
+# Conveyance probabilities (Papakonstantinou 2024)
+convey_prob <- c(
+  C1 = 0.741,
+  C2 = 0.727,
+  C3 = 0.059,
+  C4 = 0.012  
+)
+```
+
+# 5. Demand inputs
+
+```{r demand-inputs}
+# Annual incident volume calibrated to NIAS 2024/25 attended incidents
+annual_incidents <- 173695
+
+# Category mix from NIAS 2022/23 published figures.
+# C1 includes Cat1 + Cat1T merged into one high-urgency group.
+cat_share <- c(
+  C1 = (12793 + 9088) / 148545,
+  C2 =  93383         / 148545,
+  C3 =  32280         / 148545,
+  C4 =   1001         / 148545
+)
+
+annual_by_cat <- annual_incidents * cat_share
+weekly_by_cat <- annual_by_cat / 52.1429  # avg weeks per year
+daily_by_cat  <- annual_by_cat / 365
+
+weekly_by_cat
+
+#Weekly demand profile
+
+demand_mode <- "data"
+
+weekly_counts_mat <- as.matrix(ambulance_rows[, hour_names])
+
+if (demand_mode == "data") {
+  weekly_profile <- weekly_counts_mat / base::sum(weekly_counts_mat)
+} else {
+  hour_profile <- colSums(weekly_counts_mat)
+  hour_profile <- hour_profile / sum(hour_profile)
+  # replicate the 24-hour profile to every day, normalise to 168 cells
+  weekly_profile <- matrix(rep(hour_profile, each = 7), nrow = 7) / 7
+  dimnames(weekly_profile) <- list(day_order, hour_names)
+}
+
+stopifnot(abs(sum(weekly_profile) - 1) < 1e-10)
+
+# Category-specific weekly demand rates (expected counts per hour block)
+c1_weekly <- weekly_by_cat["C1"] * weekly_profile
+c2_weekly <- weekly_by_cat["C2"] * weekly_profile
+c3_weekly <- weekly_by_cat["C3"] * weekly_profile
+c4_weekly <- weekly_by_cat["C4"] * weekly_profile
+```
+
+
+# 6. Ambulance staffing schedule
+
+```{r staffing}
+# NIAS DCA availability by day of week (NI Assembly answer 2025)
+# Flat staffing: average across weekdays, applied every day
+day_dca_raw   <- rep(round(mean(c(65,64,64,64,62,60,60))), 7)
+night_dca_raw <- rep(round(mean(c(47,47,47,47,52,52,51))), 7)
+
+# Share effectively dispatchable (as opposed to on-break, off-road, etc.)
+dispatchable_fraction <- 0.80
+day_dca   <- round(day_dca_raw   * dispatchable_fraction)
+night_dca <- round(night_dca_raw * dispatchable_fraction)
+
+# 24-hour profile for a given day:
+#   00-05  night core        (6 hours)
+#   06-07  ramp up            (2 hours)
+#   08-17  day core          (10 hours)
+#   18-19  ramp down          (2 hours)
+#   20-23  night core         (4 hours)
+make_daily_staff_profile <- function(day_val, night_val) {
+  c(rep(night_val, 6),
+    rep(round((night_val + day_val) / 2), 2),
+    rep(day_val, 10),
+    rep(round((night_val + day_val) / 2), 2),
+    rep(night_val, 4))
+}
+
+weekly_staff_by_hour <- unlist(
+  lapply(seq_len(7), function(i) make_daily_staff_profile(day_dca[i], night_dca[i]))
+)
+stopifnot(length(weekly_staff_by_hour) == 168)
+
+amb_schedule <- schedule(
+  timetable = seq(0, by = 60, length.out = 168),
+  values    = weekly_staff_by_hour,
+  period    = 7 * 24 * 60
+)
+
+# Maximum queue wait before renege. C1/C2 never renege; C3/C4 do.
+max_wait_by_cat <- c(C1 = Inf, C2 = Inf, C3 = 720, C4 = 360)
+```
+
+# 7. Figure: visualisation of demand inputs
+
+
+```{r fig-demand-heatmap, fig.height=4.5, fig.width=10}
+weekly_total <- c1_weekly + c2_weekly + c3_weekly + c4_weekly  # 7x24 matrix
+
+heatmap_df <- expand.grid(
+  day_idx = seq_len(7),
+  hour    = 0:23,
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    demand = weekly_total[cbind(day_idx, hour + 1)],
+    day    = factor(day_order[day_idx], levels = rev(day_order))  # Mon at top
+  )
+
+ggplot(heatmap_df, aes(x = hour, y = day, fill = demand)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "inferno", name = "Calls/hr") +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  labs(
+    title    = "Expected ambulance incidents (calls/hour) by day and hour",
+    subtitle = "173,695 annual incidents across NI, divided up into hourly demand according to NHS England data",
+    x = "Hour of day",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    panel.grid    = element_blank(),
+    axis.text.y   = element_text(face = "bold")
+  )
+```
+
+# 8. Trajectory builder
+
+```{r trajectory}
+make_call_trajectory <- function(env, cat, convey_prob_local,
+                                 max_wait = Inf,
+                                 use_handover_queue = TRUE,
+                                 clinical_handover_fn = clinical_handover_time) {
+
+  # no-convey branch
+  no_convey_traj <- trajectory(paste0("no_convey_", cat)) %>%
+    set_attribute("conveyed", 0) %>%
+    timeout(clear_time)
+
+  # convey branch: with or without a handover queue 
+  if (use_handover_queue) {
+    convey_traj <- trajectory(paste0("convey_", cat)) %>%
+      set_attribute("conveyed", 1) %>%
+      timeout(function() transport_time(cat)) %>%
+      set_attribute("handover_arrive", function() now(env)) %>%
+      seize("handover", 1) %>%
+      set_attribute("handover_queue_wait",
+                    function() now(env) - get_attribute(env, "handover_arrive")) %>%
+      timeout(function() clinical_handover_fn(cat)) %>%
+      set_attribute("handover_duration",
+                    function() now(env) - get_attribute(env, "handover_arrive")) %>%
+      release("handover", 1) %>%
+      timeout(clear_time)
+  } else {
+    convey_traj <- trajectory(paste0("convey_", cat)) %>%
+      set_attribute("conveyed", 1) %>%
+      timeout(function() transport_time(cat)) %>%
+      set_attribute("handover_arrive", function() now(env)) %>%
+      timeout(function() clinical_handover_fn(cat)) %>%
+      set_attribute("handover_duration",
+                    function() now(env) - get_attribute(env, "handover_arrive")) %>%
+      timeout(clear_time)
+  }
+
+  # main: queue for ambulance, respond
+  main <- trajectory(paste("traj", cat)) %>%
+    set_attribute("arrival_time", function() now(env)) %>%
+    set_attribute("expired", 0)
+
+  if (is.finite(max_wait)) {
+    expire_traj <- trajectory(paste0(cat, "_expired")) %>%
+      set_attribute("expired", 1)
+    main <- main %>% renege_in(max_wait, out = expire_traj)
+  }
+
+  main <- main %>% seize("ambulances", 1)
+
+  if (is.finite(max_wait)) {
+    main <- main %>% renege_abort()
+  }
+
+  main <- main %>%
+    set_attribute("queue_wait",
+                  function() now(env) - get_attribute(env, "arrival_time")) %>%
+    timeout(mobilise_time) %>%
+    timeout(function() travel_to_scene(cat)) %>%
+    set_attribute("response_time",
+                  function() now(env) - get_attribute(env, "arrival_time")) %>%
+    timeout(function() scene_time(cat)) %>%
+    branch(
+      function() ifelse(runif(1) < convey_prob_local[[cat]], 2, 1),
+      continue = c(TRUE, TRUE),
+      no_convey_traj,
+      convey_traj
+    ) %>%
+    release("ambulances", 1)
+
+  main
+}
+```
+
+# 9. Arrival generator
+
+```{r arrival-gen}
+# Non-homogeneous Poisson: piecewise rate over the 7x24 lattice,
+# wrapped to a weekly period.
+make_interarrival <- function(env, lambda_weekly, start_day = 1) {
+  force(env); force(lambda_weekly); force(start_day)
+  function() {
+    current_time <- now(env)
+    sim_day  <- floor(current_time / (24 * 60))
+    day_idx  <- ((start_day - 1 + sim_day) %% 7) + 1
+    minute_in_day <- current_time %% (24 * 60)
+    hour_idx <- floor(minute_in_day / 60) + 1
+
+    rate_per_hour <- lambda_weekly[day_idx, hour_idx]
+    rate_per_min  <- rate_per_hour / 60
+
+    if (rate_per_min <= 0) return(60 - (minute_in_day %% 60))
+    rexp(1, rate = rate_per_min)
+  }
+}
+```
+
+# 10. Single-replication runner
+
+```{r single-rep}
+run_one_rep <- function(
+  scenario_name            = "Baseline",
+  demand_mult              = 1,
+  staff_mult               = 1,
+  handover_capacity_delta  = 0,     # additive bays (+1, -1, etc.)
+  convey_mult              = 1,
+  shape_mult               = 1,     # power transform on demand profile (not used)
+  seed                     = NULL
+) {
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # Local demand profile
+  prof_local <- weekly_profile ^ shape_mult
+  prof_local <- prof_local / sum(prof_local)
+
+  c1_local <- weekly_by_cat["C1"] * prof_local * demand_mult
+  c2_local <- weekly_by_cat["C2"] * prof_local * demand_mult
+  c3_local <- weekly_by_cat["C3"] * prof_local * demand_mult
+  c4_local <- weekly_by_cat["C4"] * prof_local * demand_mult
+
+  # Local staffing
+  staff_local <- pmax(1, round(weekly_staff_by_hour * staff_mult))
+  amb_sched_local <- schedule(
+    timetable = seq(0, by = 60, length.out = 168),
+    values    = staff_local,
+    period    = 7 * 24 * 60
+  )
+
+  # Local conveyance probabilities
+  convey_local <- convey_prob
+  convey_local["C2"] <- min(0.99, convey_local["C2"] * convey_mult)
+  convey_local["C3"] <- min(0.99, convey_local["C3"] * convey_mult)
+  convey_local["C4"] <- min(0.99, convey_local["C4"] * convey_mult)
+
+  # Local handover capacity (additive: baseline +/- bays)
+  ho_cap_local <- max(1, handover_capacity + handover_capacity_delta)
+
+  # Build environment
+  env <- simmer(paste0("scen_", scenario_name))
+
+  c1_traj <- make_call_trajectory(env, "C1", convey_local,
+                                  max_wait = max_wait_by_cat["C1"],
+                                  use_handover_queue = use_handover_queue)
+  c2_traj <- make_call_trajectory(env, "C2", convey_local,
+                                  max_wait = max_wait_by_cat["C2"],
+                                  use_handover_queue = use_handover_queue)
+  c3_traj <- make_call_trajectory(env, "C3", convey_local,
+                                  max_wait = max_wait_by_cat["C3"],
+                                  use_handover_queue = use_handover_queue)
+  c4_traj <- make_call_trajectory(env, "C4", convey_local,
+                                  max_wait = max_wait_by_cat["C4"],
+                                  use_handover_queue = use_handover_queue)
+
+  env <- env %>%
+    add_resource("ambulances", capacity = amb_sched_local,
+                 queue_size = Inf, preemptive = FALSE)
+
+  if (use_handover_queue) {
+    env <- env %>% add_resource("handover",
+                                capacity   = ho_cap_local,
+                                queue_size = Inf)
+  }
+
+  env <- env %>%
+    add_generator("C1_", c1_traj, make_interarrival(env, c1_local),
+                  priority = 4, mon = 2) %>%
+    add_generator("C2_", c2_traj, make_interarrival(env, c2_local),
+                  priority = 3, mon = 2) %>%
+    add_generator("C3_", c3_traj, make_interarrival(env, c3_local),
+                  priority = 2, mon = 2) %>%
+    add_generator("C4_", c4_traj, make_interarrival(env, c4_local),
+                  priority = 1, mon = 2)
+
+  run(env, until = sim_horizon)
+
+  # Extract outputs
+  arrivals_all <- get_mon_arrivals(env) %>%
+    dplyr::mutate(
+      category = dplyr::case_when(
+        startsWith(name, "C1_") ~ "C1",
+        startsWith(name, "C2_") ~ "C2",
+        startsWith(name, "C3_") ~ "C3",
+        startsWith(name, "C4_") ~ "C4",
+        TRUE ~ NA_character_
+      ),
+      total_time = end_time - start_time
+    )
+  arrivals <- arrivals_all %>% dplyr::filter(start_time >= warm_up)
+
+  # Per-call attributes
+  attrs <- get_mon_attributes(env) %>%
+    dplyr::filter(key %in% c("queue_wait", "response_time", "conveyed",
+                             "expired", "handover_duration",
+                             "handover_queue_wait")) %>%
+    dplyr::group_by(name, key) %>%
+    dplyr::slice_tail(n = 1) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      category = dplyr::case_when(
+        startsWith(name, "C1_") ~ "C1",
+        startsWith(name, "C2_") ~ "C2",
+        startsWith(name, "C3_") ~ "C3",
+        startsWith(name, "C4_") ~ "C4",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::select(name, category, key, value) %>%
+    tidyr::pivot_wider(names_from = key, values_from = value, values_fill = 0)
+
+  # Category KPIs (exclude expired calls as they never got an ambulance)
+  kpis_by_category <- arrivals %>%
+    dplyr::left_join(attrs, by = c("name", "category")) %>%
+    dplyr::mutate(expired = dplyr::coalesce(expired, 0)) %>%
+    dplyr::group_by(category) %>%
+    dplyr::summarise(
+      n_calls            = dplyr::n(),
+      n_finished         = sum(finished, na.rm = TRUE),
+      n_expired          = sum(expired == 1, na.rm = TRUE),
+      pct_expired        = mean(expired == 1, na.rm = TRUE),
+      mean_queue_wait    = mean(queue_wait[finished & expired == 0],      na.rm = TRUE),
+      p95_queue_wait     = quantile(queue_wait[finished & expired == 0], 0.95, na.rm = TRUE),
+      mean_response_time = mean(response_time[finished & expired == 0],   na.rm = TRUE),
+      p95_response_time  = quantile(response_time[finished & expired == 0], 0.95, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Resource summary
+  resource_summary <- get_mon_resources(env) %>%
+    dplyr::filter(time >= warm_up) %>%
+    dplyr::arrange(resource, time) %>%
+    dplyr::group_by(resource) %>%
+    dplyr::mutate(
+      next_time = dplyr::lead(time, default = sim_horizon),
+      dt = next_time - time
+    ) %>%
+    dplyr::summarise(
+      avg_busy     = weighted.mean(server, dt, na.rm = TRUE),
+      avg_queue    = weighted.mean(queue,  dt, na.rm = TRUE),
+      avg_capacity = weighted.mean(capacity, dt, na.rm = TRUE),
+      utilisation  = avg_busy / avg_capacity,
+      .groups = "drop"
+    )
+
+  # Handover summary
+  handover_monitor <- attrs %>%
+    dplyr::filter(handover_duration > 0) %>%
+    dplyr::select(name, category, handover_duration, handover_queue_wait)
+
+  handover_summary <- handover_monitor %>%
+    dplyr::summarise(
+      n_handover     = dplyr::n(),
+      mean_handover  = mean(handover_duration,     na.rm = TRUE),
+      mean_ho_queue  = mean(handover_queue_wait,   na.rm = TRUE),
+      p95_handover   = quantile(handover_duration, 0.95, na.rm = TRUE),
+      pct_over_60    = mean(handover_duration > 60,  na.rm = TRUE),
+      pct_over_180   = mean(handover_duration > 180, na.rm = TRUE)
+    )
+
+  # Resource time series (for queue-length plots)
+  resource_ts <- get_mon_resources(env) %>%
+    dplyr::filter(time >= warm_up)
+
+  list(
+    scenario         = scenario_name,
+    arrivals         = arrivals,
+    attrs            = attrs,
+    kpis_by_category = kpis_by_category,
+    resource_summary = resource_summary,
+    handover_monitor = handover_monitor,
+    handover_summary = handover_summary,
+    resource_ts      = resource_ts
+  )
+}
+```
+
+# 11. Multi-replication runner
+
+```{r multi-rep}
+run_one_scenario <- function(
+  scenario_name = "Baseline",
+  demand_mult              = 1,
+  staff_mult               = 1,
+  handover_capacity_delta  = 0,
+  convey_mult              = 1,
+  shape_mult               = 1,
+  n_rep                    = 50,     
+  seed_start               = 4001
+) {
+  rep_runs <- purrr::map(
+    seq_len(n_rep),
+    function(i) run_one_rep(
+      scenario_name           = paste0(scenario_name, "_rep", i),
+      demand_mult             = demand_mult,
+      staff_mult              = staff_mult,
+      handover_capacity_delta = handover_capacity_delta,
+      convey_mult             = convey_mult,
+      shape_mult              = shape_mult,
+      seed                    = seed_start + i - 1
+    )
+  )
+
+  bind_tag <- function(extract) {
+    purrr::map2_dfr(rep_runs, seq_len(n_rep),
+                    function(r, i) extract(r) %>% dplyr::mutate(rep = i))
+  }
+
+  kpis_all    <- bind_tag(function(r) r$kpis_by_category)
+  res_all     <- bind_tag(function(r) r$resource_summary)
+  ho_all      <- bind_tag(function(r) r$handover_summary)
+  arrivals_all<- bind_tag(function(r) r$arrivals)
+  attrs_all   <- bind_tag(function(r) r$attrs)
+  ho_mon_all  <- bind_tag(function(r) r$handover_monitor)
+  res_ts_all  <- bind_tag(function(r) r$resource_ts)
+
+  kpis_mean <- kpis_all %>%
+    dplyr::group_by(category) %>%
+    dplyr::summarise(
+      n_calls            = mean(n_calls,            na.rm = TRUE),
+      n_finished         = mean(n_finished,         na.rm = TRUE),
+      n_expired          = mean(n_expired,          na.rm = TRUE),
+      pct_expired        = mean(pct_expired,        na.rm = TRUE),
+      mean_queue_wait    = mean(mean_queue_wait,    na.rm = TRUE),
+      p95_queue_wait     = mean(p95_queue_wait,     na.rm = TRUE),
+      mean_response_time = mean(mean_response_time, na.rm = TRUE),
+      p95_response_time  = mean(p95_response_time,  na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  list(
+    scenario             = scenario_name,
+    rep_runs             = rep_runs,
+    kpis_by_category     = kpis_mean,
+    kpis_by_category_all = kpis_all,
+    resource_summary_all = res_all,
+    handover_summary_all = ho_all,
+    handover_monitor_all = ho_mon_all,
+    arrivals             = arrivals_all,
+    attrs                = attrs_all,
+    resource_ts_all      = res_ts_all
+  )
+}
+```
+
+# 12. Run the baseline
+
+```{r run-baseline}
+# 60 simulated days per replication, the first 14 days discarded as warm-up
+baseline_run <- cached(
+  "des_baseline_run.rds",
+  run_one_scenario(scenario_name = "Baseline",
+                   n_rep         = n_rep_base,
+                   seed_start    = 4001)
+)
+
+baseline_run$kpis_by_category
+```
+
+```{r baseline-handover-check}
+# Calibration check: overall handover metrics (pooled across reps)
+baseline_run$handover_summary_all %>%
+  dplyr::summarise(
+    n_handover    = mean(n_handover,    na.rm = TRUE),
+    mean_handover = mean(mean_handover, na.rm = TRUE),
+    mean_ho_queue = mean(mean_ho_queue, na.rm = TRUE),
+    p95_handover  = mean(p95_handover,  na.rm = TRUE),
+    pct_over_60   = mean(pct_over_60,   na.rm = TRUE),
+    pct_over_180  = mean(pct_over_180,  na.rm = TRUE)
+  )
+```
+
+# 13. Calibration summary
+
+```{r calibration-table}
+calib <- baseline_run$kpis_by_category_all %>%
+  dplyr::group_by(category) %>%
+  dplyr::summarise(
+    model_mean_resp = mean(mean_response_time, na.rm = TRUE),
+    model_se_resp   = sd(mean_response_time,  na.rm = TRUE) / sqrt(dplyr::n()),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    # NIAS / NHS targets for comparison
+    nhs_target = dplyr::case_when(
+      category == "C1" ~ "mean 7 min",
+      category == "C2" ~ "mean 18 min",
+      category == "C3" ~ "P90 120 min",
+      category == "C4" ~ "P90 180 min"
+    ),
+    model_mean_resp_txt = sprintf("%.1f (%.1f, %.1f)",
+                                  model_mean_resp,
+                                  model_mean_resp - 1.96 * model_se_resp,
+                                  model_mean_resp + 1.96 * model_se_resp)
+  ) %>%
+  dplyr::select(category, model_mean_resp_txt, nhs_target)
+
+calib
+```
+
+# 14. Figure B: response-time decomposition (NEW)
+
+Breaks mean response time into the travel/mobilisation component and the
+queue-wait component, showing which is the dominant driver of delay for
+each category.
+
+```{r fig-decomposition, fig.height=4, fig.width=7}
+decomp <- baseline_run$kpis_by_category_all %>%
+  dplyr::group_by(category) %>%
+  dplyr::summarise(
+    mean_resp    = mean(mean_response_time, na.rm = TRUE),
+    mean_queue   = mean(mean_queue_wait,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    travel_mob = pmax(0, mean_resp - mean_queue)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(travel_mob, mean_queue),
+    names_to  = "component",
+    values_to = "minutes"
+  ) %>%
+  dplyr::mutate(
+    component = factor(component,
+                       levels = c("mean_queue", "travel_mob"),
+                       labels = c("Queue wait", "Travel + mobilise"))
+  )
+
+ggplot(decomp, aes(x = category, y = minutes, fill = component)) +
+  geom_col(width = 0.65, colour = "black", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.1f", minutes)),
+            position = position_stack(vjust = 0.5),
+            colour = "white", fontface = "bold", size = 3.5) +
+  scale_fill_manual(values = c("Queue wait" = "#D55E00",
+                               "Travel + mobilise" = "#0072B2")) +
+  labs(
+    title = "Response-time decomposition by call category",
+    subtitle = "Baseline replications. Means only.",
+    x = "Call category",
+    y = "Mean response time (minutes)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+# 15. Figure C: CDF of response times, with vs without queueing
+
+```{r fig-cdf, fig.height=4, fig.width=10}
+cdf_long <- baseline_run$arrivals %>%
+  dplyr::left_join(
+    baseline_run$attrs %>%
+      dplyr::select(name, category, rep, response_time, queue_wait, expired),
+    by = c("name", "category", "rep")
+  ) %>%
+  dplyr::filter(finished == TRUE,
+                dplyr::coalesce(expired, 0) == 0,
+                !is.na(response_time)) %>%
+  dplyr::transmute(
+    category = factor(category, levels = c("C1","C2","C3","C4")),
+    `With queueing (baseline)`      = response_time,
+    `Without queueing (mob+travel)` = response_time - queue_wait
+  ) %>%
+  tidyr::pivot_longer(-category, names_to = "scenario", values_to = "minutes")
+
+ggplot(cdf_long, aes(x = minutes, colour = scenario, linetype = scenario)) +
+  stat_ecdf(geom = "step", linewidth = 0.9) +
+  facet_wrap(~ category, ncol = 2) +             
+  coord_cartesian(xlim = c(0, 30)) +
+  scale_colour_manual(
+    values = c("With queueing (baseline)"      = "#222222",
+               "Without queueing (mob+travel)" = "#D55E00")
+  ) +
+  scale_linetype_manual(
+    values = c("With queueing (baseline)"      = "solid",
+               "Without queueing (mob+travel)" = "dashed")
+  ) +
+  labs(
+    title    = "Response-time CDFs: with vs without queueing",
+    x = "Response time (minutes)",
+    y = "Cumulative probability",
+    colour = NULL, linetype = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+```{r run-stress}
+stress_run <- cached(
+  "des_stress_run.rds",
+  run_one_scenario(scenario_name           = "Stress",
+                   handover_capacity_delta = -1,   # 4 bays
+                   n_rep                   = n_rep_stress,
+                   seed_start              = 4001)
+)
+```
+
+
+15b. CDF of handover times
+
+```{r fig-handover-cdf, fig.height=4, fig.width=7}
+
+ho_cdf_data <- baseline_run$handover_monitor_all %>%
+  dplyr::filter(handover_duration > 0) %>%
+  dplyr::transmute(
+    `Total handover (with queue)` = handover_duration,
+    `Clinical handover only`      = handover_duration - handover_queue_wait
+  ) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to = "scenario",
+    values_to = "minutes"
+  )
+
+ho_cdf_data_stress <- stress_run$handover_monitor_all %>%
+  dplyr::filter(handover_duration > 0) %>%
+  dplyr::transmute(
+    `Total handover (with queue)` = handover_duration,
+    `Clinical handover only`      = handover_duration - handover_queue_wait
+  ) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to = "scenario",
+    values_to = "minutes"
+  )
+
+ggplot(ho_cdf_data, aes(x = minutes, colour = scenario, linetype = scenario)) +
+  stat_ecdf(geom = "step", linewidth = 0.9) +
+  coord_cartesian(xlim = c(0, quantile(ho_cdf_data$minutes, 0.99))) +
+  scale_colour_manual(
+    values = c(
+      "Total handover (with queue)" = "#222222",
+      "Clinical handover only"      = "#D55E00"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Total handover (with queue)" = "solid",
+      "Clinical handover only"      = "dashed"
+    )
+  ) +
+  labs(
+    title = "Baseline run: Handover duration with vs without queueing",
+    x = "Handover duration (minutes)",
+    y = "Cumulative probability",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggplot(ho_cdf_data_stress, aes(x = minutes, colour = scenario, linetype = scenario)) +
+  stat_ecdf(geom = "step", linewidth = 0.9) +
+  coord_cartesian(xlim = c(0, quantile(ho_cdf_data_stress$minutes, 0.99))) +
+  scale_colour_manual(
+    values = c(
+      "Total handover (with queue)" = "#222222",
+      "Clinical handover only"      = "#D55E00"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Total handover (with queue)" = "solid",
+      "Clinical handover only"      = "dashed"
+    )
+  ) +
+  labs(
+    title = "Stress run: Handover duration with vs without queueing",
+    x = "Handover duration (minutes)",
+    y = "Cumulative probability",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+```
+
+
+
+Day of week plot for diagnosis:
+```{r}
+
+queue_over_time <- baseline_run$resource_ts_all %>%
+  dplyr::filter(resource %in% c("ambulances", "handover"),
+                time >= warm_up) %>%
+  dplyr::arrange(rep, resource, time) %>%
+  dplyr::group_by(rep, resource) %>%
+  dplyr::mutate(
+    next_time = dplyr::lead(time, default = sim_horizon),
+    dt        = pmax(next_time - time, 0),
+    sim_hour  = floor((time - warm_up) / 60)
+  ) %>%
+  dplyr::group_by(rep, resource, sim_hour) %>%
+  dplyr::summarise(
+    mean_queue = weighted.mean(queue, w = dt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    sim_day  = sim_hour / 24,
+    resource = dplyr::recode(resource,
+                             ambulances = "Ambulance queue",
+                             handover   = "Handover bay queue")
+  )
+
+ggplot(queue_over_time,
+       aes(x = sim_day, y = mean_queue, group = rep)) +
+  geom_line(alpha = 0.25, colour = "#0072B2", linewidth = 0.4) +
+  facet_wrap(~ resource, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, sim_days - warm_up/(24*60), by = 7)) +
+  labs(title    = "Queue length over the full post-warmup simulation (all reps overlaid)",
+       subtitle = "Flat baseline that drains overnight = no persistent backlog. Rising trend = instability.",
+       x = "Simulation day (post-warmup)",
+       y = "Hourly mean queue length") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        strip.text = element_text(face = "bold"))
+```
+
+# 16. Figure D: ambulance capacity vs demand across the week (NEW)
+
+Sustainable throughput is the maximum call rate the current ambulance
+pool could sustain given the mean job-cycle length. Where demand
+approaches or exceeds throughput, queueing happens.
+
+```{r fig-capacity-vs-demand, fig.height=4, fig.width=10}
+# Mean job cycle (minutes), weighted by category mix and conveyance rate
+mean_job_cycle <- local({
+  # Rough weighted mean: mob + travel + scene + (convey_p * transport) + (convey_p * handover) + clear
+  w <- cat_share
+  job <- function(cat) {
+    row <- function(cmp) job_params[job_params$component == cmp, ][[cat]]
+    p   <- convey_prob[[cat]]
+    row("mobilise") + row("travel") + row("scene") +
+      p * row("transport") + p * row("handover") +
+      row("clear")
+  }
+  sum(sapply(names(w), job) * w)
+})
+mean_job_cycle  
+
+# Demand: average incidents/hour for each of the 168 hour cells
+demand_per_hour <- as.numeric(t(weekly_total))   # 7 days x 24 hours, rowwise
+# Throughput: staff / (job_cycle in hours) = staff * 60 / job_cycle (per hr)
+throughput_per_hour <- weekly_staff_by_hour * 60 / mean_job_cycle
+
+cap_demand_df <- tibble::tibble(
+  index      = seq_along(demand_per_hour),
+  hour_of_week = index - 1,
+  demand     = demand_per_hour,
+  throughput = throughput_per_hour,
+  day_idx    = floor(hour_of_week / 24) + 1,
+  hour       = hour_of_week %% 24,
+  day        = factor(day_order[day_idx], levels = day_order)
+)
+
+day_breaks <- tibble::tibble(
+  x     = seq(0, 168, by = 24),
+  label = c(day_order, "Mon")
+)
+
+ggplot(cap_demand_df, aes(x = hour_of_week)) +
+  geom_ribbon(aes(ymin = 0, ymax = throughput),
+              fill = "grey85", alpha = 0.7) +
+  geom_line(aes(y = throughput), colour = "grey30", linewidth = 0.8) +
+  geom_line(aes(y = demand), colour = "#D55E00", linewidth = 0.9,
+            linetype = "dashed") +
+  geom_vline(xintercept = seq(24, 144, by = 24),
+             colour = "grey80", linewidth = 0.3) +
+  scale_x_continuous(breaks = day_breaks$x, labels = day_breaks$label,
+                     expand = c(0, 0), limits = c(0, 168)) +
+  labs(
+    title = "Sustainable throughput (grey) vs incident demand (red) across the week",
+
+    x = NULL,
+    y = "Incidents per hour"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+# 17. Figure: queue length by time of day (category-stacked)
+
+```{r fig-queue-by-hour, fig.height=4, fig.width=8}
+cats <- c("C1","C2","C3","C4")
+queue_intervals <- baseline_run$arrivals %>%
+  dplyr::left_join(
+    baseline_run$attrs %>% dplyr::select(name, category, rep, queue_wait, expired),
+    by = c("name", "category", "rep")
+  ) %>%
+  dplyr::mutate(
+    expired    = dplyr::coalesce(expired, 0),
+    queue_wait = dplyr::coalesce(queue_wait, 0),
+    queue_start = pmax(start_time, warm_up),
+    queue_end = dplyr::case_when(
+      expired == 1 ~ pmin(end_time, sim_horizon),
+      TRUE         ~ pmin(start_time + queue_wait, sim_horizon)
+    )
+  ) %>%
+  dplyr::filter(category %in% cats, queue_end > queue_start)
+
+make_minute_queue <- function(df, warm_up, sim_horizon) {
+  n_min <- sim_horizon - warm_up
+  delta <- numeric(n_min + 1)
+  if (nrow(df) > 0) {
+    s <- pmin(pmax(0, ceiling(df$queue_start - warm_up)), n_min - 1)
+    e <- pmin(pmax(0, ceiling(df$queue_end   - warm_up)), n_min)
+    for (i in seq_along(s)) {
+      delta[s[i] + 1] <- delta[s[i] + 1] + 1
+      if (e[i] + 1 <= n_min + 1) delta[e[i] + 1] <- delta[e[i] + 1] - 1
+    }
+  }
+  tibble::tibble(time  = warm_up + 0:(n_min - 1),
+                 queue = cumsum(delta)[1:n_min])
+}
+
+rc_pairs <- queue_intervals %>% dplyr::distinct(rep, category)
+
+minute_queue <- purrr::pmap_dfr(
+  rc_pairs, function(rep, category) {
+    make_minute_queue(
+      df = queue_intervals %>% dplyr::filter(rep == !!rep, category == !!category),
+      warm_up = warm_up, sim_horizon = sim_horizon
+    ) %>% dplyr::mutate(rep = rep, category = category)
+  }
+) %>%
+  dplyr::mutate(
+    hour_of_day = floor((time %% (24 * 60)) / 60),
+    block       = floor(hour_of_day / 2) * 2
+  )
+
+# Per-category stacked means
+queue_cat_by_block <- minute_queue %>%
+  dplyr::group_by(rep, block, category) %>%
+  dplyr::summarise(mean_q = mean(queue), .groups = "drop") %>%
+  dplyr::group_by(block, category) %>%
+  dplyr::summarise(mean_queue = mean(mean_q), .groups = "drop")
+
+# Total queue CI across reps for error bars
+queue_ci <- minute_queue %>%
+  dplyr::group_by(rep, block, time) %>%
+  dplyr::summarise(total_q = sum(queue), .groups = "drop") %>%
+  dplyr::group_by(rep, block) %>%
+  dplyr::summarise(rep_mean = mean(total_q), .groups = "drop") %>%
+  dplyr::group_by(block) %>%
+  dplyr::summarise(
+    mean_total = mean(rep_mean),
+    se         = sd(rep_mean) / sqrt(dplyr::n()),
+    lwr        = pmax(0, mean_total - 1.96 * se),
+    upr        = mean_total + 1.96 * se,
+    .groups    = "drop"
+  )
+
+ggplot(queue_cat_by_block,
+       aes(x = block, y = mean_queue, fill = category)) +
+  geom_col(width = 1.6, colour = "black", linewidth = 0.3) +
+  geom_errorbar(data = queue_ci,
+                aes(x = block, ymin = lwr, ymax = upr),
+                inherit.aes = FALSE,
+                width = 0.7, linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(0, 22, 2)) +
+  scale_fill_manual(values = c(C1 = "#E24B4A", C2 = "#1D9E75",
+                               C3 = "#378ADD", C4 = "#BA7517")) +
+  labs(title    = "Mean ambulance-queue length by time of day",
+       x = "Hour of day", y = "Mean queue length", fill = "Category") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+#Handover queue figure
+
+```{r}
+# Time-weighted handover queue length by 2-hour block, with CI across reps
+ho_queue_ci <- baseline_run$resource_ts_all %>%
+  dplyr::filter(resource == "handover", time >= warm_up) %>%
+  dplyr::arrange(rep, time) %>%
+  dplyr::group_by(rep) %>%
+  dplyr::mutate(
+    next_time   = dplyr::lead(time, default = sim_horizon),
+    dt          = pmax(next_time - time, 0),
+    hour_of_day = floor((time %% (24 * 60)) / 60),
+    block       = floor(hour_of_day / 2) * 2
+  ) %>%
+  dplyr::group_by(rep, block) %>%
+  dplyr::summarise(
+    mean_q = weighted.mean(queue, w = dt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::group_by(block) %>%
+  dplyr::summarise(
+    mean_queue = mean(mean_q),
+    se         = sd(mean_q) / sqrt(dplyr::n()),
+    lwr        = pmax(0, mean_queue - 1.96 * se),
+    upr        = mean_queue + 1.96 * se,
+    .groups    = "drop"
+  )
+
+ggplot(ho_queue_ci, aes(x = block, y = mean_queue)) +
+  geom_col(width = 1.6, fill = "#BA7517", colour = "black", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr),
+                width = 0.7, linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(0, 22, 2)) +
+  labs(title    = "Mean handover-bay queue length by time of day",
+       x = "Hour of day", y = "Mean queue length") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+# 18. Figure: handover duration histogram
+
+```{r fig-handover-hist, fig.height=4, fig.width=7}
+ho_data <- baseline_run$handover_monitor_all %>%
+  dplyr::filter(handover_duration > 0)
+
+ho_mean <- mean(ho_data$handover_duration)
+ho_p99  <- quantile(ho_data$handover_duration, 0.99)
+
+ggplot(ho_data, aes(x = handover_duration)) +
+  geom_histogram(bins = 50, fill = "#BA7517", colour = "black",
+                 linewidth = 0.3) +
+  geom_vline(xintercept = ho_mean,
+             colour = "red",      linewidth = 0.8) +
+  geom_vline(xintercept = 15,
+             colour = "darkgreen", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = ho_mean, y = Inf, vjust = 2, hjust = -0.1,
+           label = sprintf("mean = %.0f min", ho_mean), colour = "red") +
+  annotate("text", x = 15,      y = Inf, vjust = 4, hjust = -0.1,
+           label = "NHS target 15 min", colour = "darkgreen") +
+  coord_cartesian(xlim = c(0, ho_p99)) +   
+  labs(title    = "Distribution of total handover duration",
+       subtitle = sprintf("x-axis clipped at 99th percentile (%.0f min) for visibility", ho_p99),
+       x = "Handover duration (minutes)", y = "Count") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+# 19. Figure: handover decomposition
+
+```{r fig-handover-split, fig.height=4, fig.width=5}
+ho_split <- ho_data %>%
+  dplyr::mutate(clinical = pmax(0, handover_duration - handover_queue_wait)) %>%
+  tidyr::pivot_longer(c(clinical, handover_queue_wait),
+                      names_to  = "component",
+                      values_to = "minutes") %>%
+  dplyr::mutate(component = dplyr::recode(component,
+                                          clinical            = "Clinical handover",
+                                          handover_queue_wait = "Queue for bay"))
+
+ggplot(ho_split, aes(x = component, y = minutes, fill = component)) +
+  geom_boxplot(outlier.alpha = 0.1, width = 0.5) +
+  scale_fill_manual(values = c("Clinical handover" = "#0F6E56",
+                               "Queue for bay"     = "#D55E00")) +
+  coord_cartesian(ylim = c(0, quantile(ho_data$handover_duration, 0.99))) +
+  labs(title = "Decomposition of handover time",
+       subtitle = "Clinical handover vs queue wait for A&E bay",
+       x = NULL, y = "Minutes") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+# 19. Figure: response time and queue wait by day of week
+
+```{r fig-boxplots-byday, fig.height=5, fig.width=9}
+day_levels <- c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
+
+plot_data_multi <- baseline_run$arrivals %>%
+  dplyr::left_join(
+    baseline_run$attrs %>%
+      dplyr::select(name, category, rep,
+                    queue_wait, response_time, expired),
+    by = c("name","category","rep")
+  ) %>%
+  dplyr::filter(finished == TRUE,
+                dplyr::coalesce(expired, 0) == 0,
+                !is.na(response_time)) %>%
+  dplyr::mutate(
+    sim_day     = floor(start_time / (24*60)),
+    weekday_num = (sim_day %% 7) + 1,
+    weekday     = factor(day_levels[weekday_num], levels = day_levels),
+    category    = factor(category, levels = c("C1","C2","C3","C4"))
+  )
+
+response_by_rep <- plot_data_multi %>%
+  dplyr::group_by(rep, weekday, category) %>%
+  dplyr::summarise(mean_response = mean(response_time, na.rm = TRUE),
+                   .groups = "drop")
+
+queue_by_rep <- plot_data_multi %>%
+  dplyr::group_by(rep, weekday, category) %>%
+  dplyr::summarise(mean_queue_wait = mean(queue_wait, na.rm = TRUE),
+                   .groups = "drop")
+
+p1 <- ggplot(response_by_rep, aes(x = weekday, y = mean_response)) +
+  geom_boxplot(outlier.alpha = 0.25, width = 0.65) +
+  facet_wrap(~ category, ncol = 4, scales = "free_y") +
+  labs(title = "Mean response time by day of week",
+       x = NULL, y = "Minutes") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        strip.text = element_text(face = "bold"))
+
+p2 <- ggplot(queue_by_rep, aes(x = weekday, y = mean_queue_wait)) +
+  geom_boxplot(outlier.alpha = 0.25, width = 0.65) +
+  facet_wrap(~ category, ncol = 4, scales = "free_y") +
+  labs(title = "Mean queue wait by day of week",
+       x = "Day of week", y = "Minutes") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        strip.text = element_text(face = "bold"))
+
+p1 / p2
+```
+
+# 20. Sensitivity analysis
+
+```{r sens-grid}
+# Four one-way sensitivity parameters:
+#   Demand      +/-10%
+#   Staff       +/-10%
+#   Handover    +/-1 bay 
+#   Conveyance  +/-10%
+scenario_grid <- tibble::tribble(
+  ~scenario,           ~parameter,          ~level,      ~demand_mult, ~staff_mult, ~handover_capacity_delta, ~convey_mult, ~shape_mult,
+  "Demand low",        "Demand",            "Low",       0.90,         1.00,        0,                        1.00,         1.00,
+  "Demand baseline",   "Demand",            "Baseline",  1.00,         1.00,        0,                        1.00,         1.00,
+  "Demand high",       "Demand",            "High",      1.10,         1.00,        0,                        1.00,         1.00,
+
+  "Staff low",         "Staff",             "Low",       1.00,         0.90,        0,                        1.00,         1.00,
+  "Staff baseline",    "Staff",             "Baseline",  1.00,         1.00,        0,                        1.00,         1.00,
+  "Staff high",        "Staff",             "High",      1.00,         1.10,        0,                        1.00,         1.00,
+
+  "Handover low",      "Handover bays",     "Low",       1.00,         1.00,       -1,                        1.00,         1.00,
+  "Handover baseline", "Handover bays",     "Baseline",  1.00,         1.00,        0,                        1.00,         1.00,
+  "Handover high",     "Handover bays",     "High",      1.00,         1.00,       +1,                        1.00,         1.00,
+
+  "Conveyance low",    "Conveyance",        "Low",       1.00,         1.00,        0,                        0.90,         1.00,
+  "Conveyance baseline","Conveyance",       "Baseline",  1.00,         1.00,        0,                        1.00,         1.00,
+  "Conveyance high",   "Conveyance",        "High",      1.00,         1.00,        0,                        1.10,         1.00
+)
+```
+
+```{r run-sens}
+scenario_runs <- cached("des_scenario_runs.rds", purrr::pmap(
+  scenario_grid,
+  function(scenario, parameter, level, demand_mult, staff_mult,
+           handover_capacity_delta, convey_mult, shape_mult) {
+
+    run <- run_one_scenario(
+      scenario_name           = scenario,
+      demand_mult             = demand_mult,
+      staff_mult              = staff_mult,
+      handover_capacity_delta = handover_capacity_delta,
+      convey_mult             = convey_mult,
+      shape_mult              = shape_mult,
+      n_rep                   = n_rep_sens,
+      seed_start              = 4001
+    )
+
+    # Keep only the important outputs, drop the per-call detail
+    light <- list(
+      scenario             = run$scenario,
+      kpis_by_category     = run$kpis_by_category,
+      kpis_by_category_all = run$kpis_by_category_all,
+      resource_summary_all = run$resource_summary_all,
+      handover_summary_all = run$handover_summary_all
+    )
+
+    rm(run); gc()
+    light
+  }
+))
+```
+
+```{r build-sens-results}
+
+sens_results <- purrr::map_dfr(scenario_runs, function(run) {
+  grid_row <- scenario_grid[scenario_grid$scenario == run$scenario, ]
+
+  ho_mean       <- mean(run$handover_summary_all$mean_handover, na.rm = TRUE)
+  ho_queue_mean <- mean(run$handover_summary_all$mean_ho_queue, na.rm = TRUE)
+
+  run$kpis_by_category %>%
+    dplyr::mutate(
+      scenario               = run$scenario,
+      parameter              = grid_row$parameter[1],
+      level                  = grid_row$level[1],
+      mean_handover_duration = ho_mean,
+      mean_ho_queue_wait     = ho_queue_mean
+    ) %>%
+    dplyr::select(scenario, parameter, level, category,
+                  mean_queue_wait, mean_response_time,
+                  mean_handover_duration, mean_ho_queue_wait)
+})
+```
+
+```{r fig-sens, fig.height=5, fig.width=10}
+# Per-category sensitivity: response time and queue wait only.
+
+sens_plot <- sens_results %>%
+  dplyr::select(parameter, level, category,
+                mean_queue_wait, mean_response_time) %>%
+  tidyr::pivot_longer(c(mean_queue_wait, mean_response_time),
+                      names_to = "metric", values_to = "value") %>%
+  dplyr::mutate(
+    metric    = dplyr::recode(metric,
+                              mean_queue_wait    = "Mean call queue wait",
+                              mean_response_time = "Mean response time"),
+    category  = factor(category, levels = c("C1","C2","C3","C4")),
+    level     = factor(level,    levels = c("Low","Baseline","High")),
+    parameter = factor(parameter,
+                       levels = c("Demand","Staff","Handover bays","Conveyance"))
+  ) %>%
+  tidyr::pivot_wider(names_from = level, values_from = value)
+
+make_panel <- function(metric_name) {
+  sens_plot %>%
+    dplyr::filter(metric == metric_name) %>%
+    ggplot(aes(x = category)) +
+    geom_linerange(aes(ymin = pmin(Low, High), ymax = pmax(Low, High)),
+                   linewidth = 0.8, colour = "grey65") +
+    geom_point(aes(y = Low),      colour = "#D55E00", size = 2.6) +
+    geom_point(aes(y = High),     colour = "#009E73", size = 2.6) +
+    geom_point(aes(y = Baseline), colour = "black",   size = 3) +
+    facet_wrap(~ parameter, scales = "fixed", nrow = 1) +
+    labs(title = metric_name, x = NULL, y = "Minutes") +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          strip.text = element_text(face = "bold"))
+}
+
+  make_panel("Mean call queue wait") +
+  patchwork::plot_annotation(
+    title = "One-way sensitivity: low (orange), baseline (black), high (green)",
+    theme = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+```
+
+```{r fig-sens-handover, fig.height=3.5, fig.width=9}
+ho_sens <- sens_results %>%
+  dplyr::distinct(parameter, level, mean_ho_queue_wait) %>%
+  dplyr::mutate(
+    level     = factor(level, levels = c("Low","Baseline","High")),
+    parameter = factor(parameter,
+                       levels = c("Demand","Staff","Handover bays","Conveyance"))
+  ) %>%
+  tidyr::pivot_wider(names_from = level, values_from = mean_ho_queue_wait)
+
+ggplot(ho_sens, aes(x = parameter)) +
+  geom_segment(aes(xend = parameter, y = Low, yend = Baseline),
+               linewidth = 0.8, colour = "grey65") +
+  geom_segment(aes(xend = parameter, y = Baseline, yend = High),
+               linewidth = 0.8, colour = "grey65") +
+  geom_point(aes(y = Low),      colour = "#D55E00", size = 3) +
+  geom_point(aes(y = High),     colour = "#009E73", size = 3) +
+  geom_point(aes(y = Baseline), colour = "black",   size = 3.5) +
+  labs(title = "Sensitivity of mean handover queue wait",
+       subtitle = "Low (orange), baseline (black), high (green)",
+       x = NULL, y = "Minutes") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"),
+        panel.grid.major.x = element_blank())
+```
+
+```{r fig-tornado, fig.height=3.5, fig.width=7}
+tornado <- sens_results %>%
+  dplyr::filter(category == "C2") %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::summarise(
+    low  = mean_queue_wait[level == "Low"],
+    base = mean_queue_wait[level == "Baseline"],
+    high = mean_queue_wait[level == "High"],
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    low_delta  = low  - base,
+    high_delta = high - base,
+    impact     = pmax(abs(low_delta), abs(high_delta))
+  ) %>%
+  dplyr::arrange(impact)
+
+tornado_long <- tornado %>%
+  dplyr::mutate(parameter = factor(parameter, levels = parameter)) %>%
+  tidyr::pivot_longer(c(low_delta, high_delta),
+                      names_to = "direction", values_to = "delta") %>%
+  dplyr::mutate(direction = dplyr::recode(direction,
+                                          low_delta  = "Low",
+                                          high_delta = "High"))
+
+ggplot(tornado_long,
+       aes(x = delta, y = parameter, fill = direction)) +
+  geom_vline(xintercept = 0, linewidth = 0.8) +
+  geom_col(width = 0.65) +
+  scale_fill_manual(values = c(Low = "#00BFC4", High = "#F8766D")) +
+  labs(title = "Tornado: effect of +/-10 percent on C2 mean queue wait",
+       x = "Change vs baseline (minutes)", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+```
+kpis for report:
+
+```{r}
+# Baseline KPI table
+baseline_run$kpis_by_category
+
+# Baseline handover summary (mean across reps)
+baseline_run$handover_summary_all %>%
+  dplyr::summarise(
+    n_handover    = mean(n_handover),
+    mean_handover = mean(mean_handover),
+    mean_ho_queue = mean(mean_ho_queue),
+    p95_handover  = mean(p95_handover)
+  )
+
+# Stress run handover distribution - quantiles of total and clinical
+stress_run$handover_monitor_all %>%
+  dplyr::filter(handover_duration > 0) %>%
+  dplyr::mutate(clinical = pmax(0, handover_duration - handover_queue_wait)) %>%
+  dplyr::summarise(
+    total_median   = median(handover_duration),
+    total_p90      = quantile(handover_duration, 0.90),
+    total_p95      = quantile(handover_duration, 0.95),
+    clinical_median = median(clinical),
+    clinical_p90    = quantile(clinical, 0.90),
+    clinical_p95    = quantile(clinical, 0.95)
+  )
+
+# Baseline equivalent for comparison
+baseline_run$handover_monitor_all %>%
+  dplyr::filter(handover_duration > 0) %>%
+  dplyr::mutate(clinical = pmax(0, handover_duration - handover_queue_wait)) %>%
+  dplyr::summarise(
+    total_median   = median(handover_duration),
+    total_p90      = quantile(handover_duration, 0.90),
+    total_p95      = quantile(handover_duration, 0.95),
+    clinical_median = median(clinical),
+    clinical_p90    = quantile(clinical, 0.90),
+    clinical_p95    = quantile(clinical, 0.95)
+  )
+```
+Response time cdf after stress run:
+
+```{r fig-stress-response-cdf, fig.height=5, fig.width=8}
+# Compare response-time distributions between baseline (5 bays) and stress (4 bays) scenarios, by call category.
+
+resp_baseline <- baseline_run$attrs %>%
+  dplyr::filter(!is.na(response_time)) %>%
+  dplyr::transmute(category, minutes = response_time,
+                   scenario = "Baseline (5 bays)")
+
+resp_stress <- stress_run$attrs %>%
+  dplyr::filter(!is.na(response_time)) %>%
+  dplyr::transmute(category, minutes = response_time,
+                   scenario = "Stress (4 bays)")
+
+resp_combined <- dplyr::bind_rows(resp_baseline, resp_stress) %>%
+  dplyr::mutate(
+    category = factor(category, levels = c("C1","C2","C3","C4")),
+    scenario = factor(scenario, levels = c("Baseline (5 bays)",
+                                           "Stress (4 bays)"))
+  )
+
+
+ggplot(resp_combined,
+       aes(x = minutes, colour = scenario, linetype = scenario)) +
+  stat_ecdf(geom = "step", linewidth = 0.9) +
+  coord_cartesian(xlim = c(0, 60))  +
+  facet_wrap(~ category, scales = "free_x") +
+  scale_colour_manual(values = c("Baseline (5 bays)" = "#222222",
+                                 "Stress (4 bays)"   = "#D55E00")) +
+  scale_linetype_manual(values = c("Baseline (5 bays)" = "solid",
+                                   "Stress (4 bays)"   = "dashed")) +
+  labs(title = "Response time CDFs: baseline vs stress scenario",
+       x = "Response time (minutes)",
+       y = "Cumulative probability",
+       colour = NULL, linetype = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+```{r}
+# Baseline handover queue wait - CI across replications
+baseline_ci <- scenario_runs[[which(scenario_grid$scenario == "Handover baseline")]]$handover_summary_all %>%
+  dplyr::summarise(
+    n  = dplyr::n(),
+    mu = mean(mean_ho_queue),
+    se = sd(mean_ho_queue) / sqrt(dplyr::n()),
+    lo = mu - qt(0.975, n - 1) * se,
+    hi = mu + qt(0.975, n - 1) * se
+  )
+
+# Stress handover queue wait - CI across replications
+stress_ci <- scenario_runs[[which(scenario_grid$scenario == "Handover low")]]$handover_summary_all %>%
+  dplyr::summarise(
+    n  = dplyr::n(),
+    mu = mean(mean_ho_queue),
+    se = sd(mean_ho_queue) / sqrt(dplyr::n()),
+    lo = mu - qt(0.975, n - 1) * se,
+    hi = mu + qt(0.975, n - 1) * se
+  )
+
+baseline_ci
+stress_ci
+```
+
+```{r list-cache}
+list.files(cache_dir, pattern = "^des_")
+```
+
+

@@ -1,0 +1,3057 @@
+---
+title: "SOR4001 Project code"
+author: "Andrew"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+1.  Packages
+
+```{r}
+if (!require(readxl)) install.packages("readxl")
+if (!require(dplyr)) install.packages("dpylr")
+if (!require(tidyr)) install.packages("tidyr")
+if (!require(sf)) install.packages("sf")
+if (!require(stringr)) install.packages("stringr")
+if (!require(tibble)) install.packages("tibble")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(patchwork)) install.packages("patchwork")
+if (!require(officer)) install.packages("officer")
+if (!require(flextable)) install.packages("flextable")
+if (!require(rvg)) install.packages("rvg")
+if (!require(future.apply)) install.packages("future.apply")
+if (!require(scales)) install.packages("scales")
+if (!require(plotly)) install.packages("plotly")
+if (!require(purrr)) install.packages("purrr")
+if (!require(ggpattern)) install.packages("ggpattern")
+
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(officer)
+library(flextable)
+library(rvg)
+library(future.apply)
+library(scales)
+library(plotly)
+library(purrr)
+library(ggpattern)
+
+```
+
+Seed
+
+```{r}
+set.seed(12345)
+```
+
+2.  Data importing and merging
+
+```{r}
+
+#Loading the data into r
+
+#Census
+census  <- read.csv(file.choose(), stringsAsFactors = FALSE) #Select census with values dataset
+
+census <- census %>% rename(zone_code = data_zone_code)
+
+
+#Old LGD 1992 lookup table
+
+zone_to_lgd_path <- file.choose() #Select "2021 data zone to old lgd and urban rural classification"
+
+zone_to_lgd <- read_excel(path = zone_to_lgd_path, sheet = 4)
+
+zone_to_lgd <- zone_to_lgd %>%
+  select(DZ2021_code, LGD1992_code, LGD1992_name) %>%
+  rename(zone_code = DZ2021_code, lgd = LGD1992_code, lgd_name = LGD1992_name)
+
+#Urban/rural classification dataset 
+
+Urban_class <- read_excel(path = zone_to_lgd_path, sheet = 5)
+
+Urban_class <- Urban_class %>%
+  select(DZ2021_code, Urban_status) %>%
+  rename(zone_code = DZ2021_code) %>%
+  mutate(Urban_status = ifelse(tolower(Urban_status) == "urban", 1L, 0L))
+
+
+#Aft model info for later (block 7)
+
+aft_model_path <- file.choose() #Choose aft_model_info
+
+#NI shapefile for later (block 10)
+
+NI_shapefile_path <- file.choose() #Choose DZ2021.shp
+
+
+#Merging LGD and urban classification datasets into census data
+
+census_merged <- census %>% 
+  left_join(zone_to_lgd, by = "zone_code") %>%
+  left_join(Urban_class, by = "zone_code")
+
+#NI lifetables for QALYs
+
+NI_lifetable_path <- file.choose()
+
+```
+
+3.  Creating the lambda value for each zone
+
+```{r}
+#3.a - creating count * prob of arrest
+census_merged <- census_merged %>% mutate(count * p)
+
+#3.b - Grouping by zone and summing
+
+zone_values <- census_merged %>% 
+  group_by(zone_code, data_zone, lgd, lgd_name, Urban_status) %>%
+  summarise(
+     count = sum(count, na.rm = TRUE),
+    lambda = sum(`count * p`, na.rm = TRUE),
+    .groups = "drop")
+```
+
+4.  Generating cardiac arrests using 1000 poisson sims for each data zone
+
+```{r}
+
+# 4.a - Example for a single data zone
+lambda_example <- zone_values$lambda[1]
+
+sim_example <- rpois(1000, lambda_example)
+
+head(sim_example)
+
+# 4.b - Grouping by zone and simulating
+
+poisson_sims <- zone_values %>%
+  rowwise() %>%
+  mutate(n_arrests = list(rpois(1000, lambda)))
+
+#4.c - expand into long form
+
+poisson_sims <- poisson_sims %>%
+  unnest(n_arrests) %>%
+  group_by(zone_code) %>%
+  mutate(sim = row_number()) %>%
+  ungroup()
+
+poisson_sims <- poisson_sims %>%
+  mutate(n_arrests = as.integer(n_arrests)) #Making sure number of arrests is an integer value so below chunk works
+
+
+```
+
+Assigning age/sex to each ca:
+
+```{r}
+
+# 1. Age-sex probabilities within each zone
+age_sex_probs <- census_merged %>%
+  transmute(zone_code, age_band, gender, prob = count * p) %>%
+  group_by(zone_code) %>%
+  mutate(prob = prob / sum(prob, na.rm = TRUE)) %>%
+  ungroup()
+
+# 2. Expand to one row per arrest
+arrests_long <- poisson_sims %>%
+  uncount(n_arrests, .id = "arrest_id") %>%
+  group_by(zone_code) %>%
+  mutate(zone_row = row_number()) %>%
+  ungroup()
+
+
+
+# 3. Number of arrests in each zone
+zone_counts <- arrests_long %>%
+  count(zone_code, name = "n")
+
+# 4. Sample age/gender for all arrests in each zone at once
+age_sex_split <- split(age_sex_probs, age_sex_probs$zone_code)
+
+sampled_demo <- map2_dfr(
+  zone_counts$zone_code,
+  zone_counts$n,
+  \(z, n) {
+    tab <- age_sex_split[[as.character(z)]]
+    draws <- sample(seq_len(nrow(tab)), size = n, replace = TRUE, prob = tab$prob)
+
+    tibble(
+      zone_code = z,
+      zone_row = seq_len(n),
+      age_band = tab$age_band[draws],
+      gender = tab$gender[draws]
+    )
+  }
+)
+
+# 5. Join back to arrest rows
+arrests_long <- arrests_long %>%
+  left_join(sampled_demo, by = c("zone_code", "zone_row")) %>%
+  select(-zone_row)
+
+
+```
+
+
+
+5.  Assign each event an hour in which it occurs
+
+```{r}
+#Example:
+
+ncounts_example <- 10
+
+hours <- sample(0:23, size = ncounts_example, replace = TRUE)
+
+hours
+
+
+#Function that converts the sampled hour to its corresponding hour block
+
+hour_to_block <- function(h) {
+  dplyr::case_when(
+    h >= 0  & h <= 7  ~ "00-07",
+    h >= 8  & h <= 9  ~ "08-09",
+    h >= 10 & h <= 13 ~ "10-13",
+    h >= 14 & h <= 23 ~ "14-23"
+  )
+}
+
+hour_to_block(hours)
+
+#Sampling the hour non-uniformly (0-23), row-wise to our simulated data (poisson_sims) 
+
+block_probs <- c(
+  "00_07" = 101 / 602,
+  "08_09" = 100 / 602,
+  "10_13" = 154 / 602,
+  "14_23" = 247 / 602
+)
+
+hour_poisson_sims <- arrests_long %>%
+  mutate(
+    hour_block = sample(
+      names(block_probs),
+      size = n(),
+      replace = TRUE,
+      prob = block_probs
+    )
+  )
+
+
+hour_poisson_sims <- hour_poisson_sims %>% #Unnesting: for each data zone, sims where n_arrests = 0 are skipped
+  unnest(hour_block)
+
+
+# 2) Make sure the factor has all levels (important if some hours missing)
+hour_poisson_sims$hour_block <- factor(hour_poisson_sims$hour_block, levels = c("00_07", "08_09", "10_13", "14_23"))
+
+# 3) Create binary columns (one-hot). This returns a matrix.
+X <- model.matrix(~ hour_block - 1, data = hour_poisson_sims)
+# columns: hour_block00_07, hour_block08_09, hour_block10_13, hour_block14_23
+
+# 4) Bind back into hour_poisson_sims (as plain numeric columns)
+hour_poisson_sims <- cbind(hour_poisson_sims, as.data.frame(X))
+
+# Rename columns to your preferred names
+names(hour_poisson_sims)[(ncol(hour_poisson_sims)-3):ncol(hour_poisson_sims)] <- c("hb_00_07", "hb_08_09", "hb_10_13", "hb_14_23")
+
+
+```
+
+6.  Merging simulated poisson data with the AFT input data to prepare for the AFT model
+
+```{r}
+df<- hour_poisson_sims %>%
+  left_join(coa_nearest_ambulance, by = "zone_code")
+```
+
+7.  AFT
+
+```{r}
+params <- read_excel(aft_model_path, sheet = 1) %>%
+  select(-matches("^Unnamed")) %>%
+  transmute(
+    lgd = lgd,
+    intercept = intercept,
+    b_ln_d1   = `ln(min_dist+1)`,
+    b_ln_d2   = `ln(2nd_closest+1)`,
+    b_lt2     = logic_less_Than_2,
+    b_h0007   = hour0007,
+    b_h0809   = hour0809,
+    b_h1013   = hour1013,
+    b_h1423   = hour1423,
+    sigma     = scale
+  )
+
+# Join by 2-letter code column eg. Fermanagh = PP
+
+df2 <- df %>%
+  left_join(
+    params %>% mutate(lgd = paste0("95", lgd)),
+    by = "lgd"
+  )
+
+
+stopifnot(sum(is.na(df2$intercept)) == 0)
+
+# Compute mu 
+df2 <- df2 %>%
+  mutate(
+    mu = intercept +
+      b_ln_d1 * ln_nearest1_miles +
+      b_ln_d2 * ln_nearest2_miles +
+      b_lt2   * near_2mi +
+      b_h0007 * hb_00_07 +
+      b_h0809 * hb_08_09 +
+      b_h1013 * hb_10_13 +
+      b_h1423 * hb_14_23
+  )
+
+# Log-logistic survival at threshold t0 = 7 (target)
+t0 <- 7
+df2 <- df2 %>%
+  mutate(
+    z = (log(t0) - mu) / sigma,
+    p_le_t0 = plogis(z),
+    s_gt_t0 = plogis(-z)
+    
+    
+  )
+
+
+df2 <- df2 %>%
+  mutate(
+    U = runif(n()),                 # U = F
+    T_sim = exp(mu + sigma * qlogis(U))
+  )
+
+```
+
+
+8. Importing lifetables into R:
+
+```{r}
+
+# Male table: A:F
+male_life <- read_excel(NI_lifetable_path
+  ,
+  sheet = "2021-2023",
+  range = "A7:F107",
+  col_names = c("age", "mx", "qx", "lx", "dx", "ex")
+) %>%
+  mutate(gender = "Male")
+
+# Female table: H:M
+female_life <- read_excel(
+  NI_lifetable_path,
+  sheet = "2021-2023",
+  range = "H7:M107",
+  col_names = c("age", "mx", "qx", "lx", "dx", "ex")
+) %>%
+  mutate(gender = "Female")
+
+# Combine into one tidy table
+life_table_raw <- bind_rows(male_life, female_life) %>%
+  select(age, gender, ex, qx)
+
+life_table_raw
+
+life_table_raw <- bind_rows(male_life, female_life) %>%
+  transmute(
+    age = as.numeric(age),
+    gender,
+    remaining_le = as.numeric(ex),
+    year_surv_rate = as.numeric(1 - qx)
+  )
+
+life_table_yearly <- life_table_raw %>%
+  transmute(
+    age = as.integer(age),
+    gender = case_when(
+      gender == "Female" ~ "1 (Female)",
+      gender == "Male" ~ "2 (Male)",
+      TRUE ~ as.character(gender)),
+    year_surv_rate = year_surv_rate)%>%
+  distinct(age, gender, .keep_all = TRUE)
+
+life_table_band <- life_table_raw %>%
+  mutate(
+    age_band = case_when(
+      age >= 0  & age <= 4  ~ "1 (0–4 years)",
+      age >= 5  & age <= 9  ~ "2 (5–9 years)",
+      age >= 10 & age <= 14 ~ "3 (10–14 years)",
+      age >= 15 & age <= 19 ~ "4 (15–19 years)",
+      age >= 20 & age <= 24 ~ "5 (20–24 years)",
+      age >= 25 & age <= 29 ~ "6 (25–29 years)",
+      age >= 30 & age <= 34 ~ "7 (30–34 years)",
+      age >= 35 & age <= 39 ~ "8 (35–39 years)",
+      age >= 40 & age <= 44 ~ "9 (40–44 years)",
+      age >= 45 & age <= 49 ~ "10 (45–49 years)",
+      age >= 50 & age <= 54 ~ "11 (50–54 years)",
+      age >= 55 & age <= 59 ~ "12 (55–59 years)",
+      age >= 60 & age <= 64 ~ "13 (60–64 years)",
+      age >= 65 & age <= 69 ~ "14 (65–69 years)",
+      age >= 70 & age <= 74 ~ "15 (70–74 years)",
+      age >= 75 & age <= 79 ~ "16 (75–79 years)",
+      age >= 80 & age <= 84 ~ "17 (80–84 years)",
+      age >= 85 & age <= 89 ~ "18 (85–89 years)",
+      age >= 90             ~ "19 (90+ years)"
+    ),
+    gender = case_when(
+      gender == "Female" ~ "1 (Female)",
+      gender == "Male"   ~ "2 (Male)"
+    )
+  ) %>%
+  group_by(age_band, gender) %>%
+  summarise(
+    remaining_le = mean(remaining_le, na.rm = TRUE),
+    year_surv_rate,
+    .groups = "drop"
+  )
+
+#Joining onto the main data
+
+#comparison <- comparison %>%
+  #left_join(life_table_band, by = c("age_band", "gender"))
+```
+
+
+
+9. FR allocations
+```{r}
+zone_count <- zone_values %>%
+  select("zone_code", "data_zone", "count", "lgd", "lgd_name")
+
+total_vol_ni <- 806   # 31 x 26 LGDs
+
+NI_shapefile <- st_read(NI_shapefile_path)
+
+NI_shapefile <- NI_shapefile %>%
+  rename("zone_code" = "DZ2021_cd")
+
+# Base table
+alloc_base <- zone_values %>%
+  ungroup() %>%
+  left_join(
+    NI_shapefile %>%
+      st_drop_geometry() %>%
+      select(zone_code, Area_ha),
+    by = "zone_code"
+  ) %>%
+  mutate(
+    area_km2 = Area_ha / 100,
+    lambda_std = lambda / sum(lambda, na.rm = TRUE),
+    area_std   = area_km2 / sum(area_km2, na.rm = TRUE)
+  )
+
+# Helper: NI-wide total allocation 
+make_alloc_ni <- function(data, score_var, rule_name, total_vol_ni = 806) {
+  out <- data %>%
+    mutate(
+      score = {{ score_var }},
+      raw_target = total_vol_ni * score / sum(score, na.rm = TRUE),
+      fr_target = floor(raw_target),
+      remainder = raw_target - fr_target,
+      rule = rule_name
+    )
+
+  n_left <- total_vol_ni - sum(out$fr_target, na.rm = TRUE)
+
+  if (n_left > 0) {
+    add_idx <- order(out$remainder, decreasing = TRUE)[1:n_left]
+    out$fr_target[add_idx] <- out$fr_target[add_idx] + 1
+  }
+
+  out
+}
+
+# Helper: 31 within each LGD 
+make_alloc_lgd <- function(data, score_var, rule_name, fr_per_lgd = 31) {
+  data %>%
+    group_by(lgd) %>%
+    mutate(
+      score = {{ score_var }},
+      raw_target = fr_per_lgd * score / sum(score, na.rm = TRUE),
+      fr_target = floor(raw_target),
+      remainder = raw_target - fr_target
+    ) %>%
+    group_modify(~{
+      d <- .x
+      n_left <- fr_per_lgd - sum(d$fr_target, na.rm = TRUE)
+      if (n_left > 0) {
+        add_idx <- order(d$remainder, decreasing = TRUE)[1:n_left]
+        d$fr_target[add_idx] <- d$fr_target[add_idx] + 1
+      }
+      d
+    }) %>%
+    ungroup() %>%
+    mutate(rule = rule_name)
+}
+
+# NI-wide exploratory rules 
+fr_alloc_lambda_across_NI <- make_alloc_ni(
+  alloc_base,
+  score_var = lambda,
+  rule_name = "lambda_across_NI",
+  total_vol_ni = total_vol_ni
+)
+
+fr_alloc_lambda_area10 <- make_alloc_ni(
+  alloc_base,
+  score_var = 0.9 * lambda_std + 0.1 * area_std,
+  rule_name = "lambda_90_area_10",
+  total_vol_ni = total_vol_ni
+)
+
+fr_alloc_lambda_area20 <- make_alloc_ni(
+  alloc_base,
+  score_var = 0.8 * lambda_std + 0.2 * area_std,
+  rule_name = "lambda_80_area_20",
+  total_vol_ni = total_vol_ni
+)
+
+fr_alloc_lambda_area025 <- make_alloc_ni(
+  alloc_base,
+  score_var = lambda * (area_km2 ^ 0.25),
+  rule_name = "lambda_x_area_pow_0.25",
+  total_vol_ni = total_vol_ni
+)
+
+fr_alloc_lambda_logarea <- make_alloc_ni(
+  alloc_base,
+  score_var = lambda * log1p(area_km2),
+  rule_name = "lambda_x_log_area",
+  total_vol_ni = total_vol_ni
+)
+
+# Fixed 31 per LGD using lambda
+fr_alloc_lambda_within_LGD <- make_alloc_lgd(
+  alloc_base,
+  score_var = lambda,
+  rule_name = "lambda_within_LGD",
+  fr_per_lgd = 31
+)
+
+# Fixed 31 per LGD using lambda + area 
+fr_alloc_lambda_area10_within_LGD <- make_alloc_lgd(
+  alloc_base,
+  score_var = 0.9 * lambda_std + 0.1 * area_std,
+  rule_name = "lambda_90_area_10_within_LGD",
+  fr_per_lgd = 31
+)
+
+fr_alloc_lambda_area20_within_LGD <- make_alloc_lgd(
+  alloc_base,
+  score_var = 0.8 * lambda_std + 0.2 * area_std,
+  rule_name = "lambda_80_area_20_within_LGD",
+  fr_per_lgd = 31
+)
+
+fr_alloc_lambda_area025_within_LGD <- make_alloc_lgd(
+  alloc_base,
+  score_var = lambda * (area_km2 ^ 0.25),
+  rule_name = "lambda_x_area_pow_0.25_within_LGD",
+  fr_per_lgd = 31
+)
+
+fr_alloc_lambda_logarea_within_LGD <- make_alloc_lgd(
+  alloc_base,
+  score_var = lambda * log1p(area_km2),
+  rule_name = "lambda_x_log_area_within_LGD",
+  fr_per_lgd = 31
+)
+
+# Fixed 31 per LGD random/equal 
+fr_alloc_random_within_LGD <- alloc_base %>%
+  group_by(lgd) %>%
+  mutate(
+    score = 1,
+    raw_target = 31 * score / sum(score, na.rm = TRUE),
+    fr_target = floor(raw_target),
+    remainder = raw_target - fr_target
+  ) %>%
+  group_modify(~{
+    d <- .x
+    n_left <- 31 - sum(d$fr_target, na.rm = TRUE)
+    if (n_left > 0) {
+      add_idx <- sample(seq_len(nrow(d)), size = n_left)
+      d$fr_target[add_idx] <- d$fr_target[add_idx] + 1
+    }
+    d
+  }) %>%
+  ungroup() %>%
+  mutate(rule = "random_within_LGD")
+
+
+# Combine all 
+fr_alloc_all_rules <- bind_rows(
+  fr_alloc_lambda_across_NI,
+  fr_alloc_lambda_area10,
+  fr_alloc_lambda_area20,
+  fr_alloc_lambda_area025,
+  fr_alloc_lambda_logarea,
+  fr_alloc_lambda_within_LGD,
+  fr_alloc_lambda_area10_within_LGD,
+  fr_alloc_lambda_area20_within_LGD,
+  fr_alloc_lambda_area025_within_LGD,
+  fr_alloc_lambda_logarea_within_LGD,
+  fr_alloc_random_within_LGD
+)
+
+fr_alloc_all_rules %>%
+  group_by(rule) %>%
+  summarise(total_fr = sum(fr_target, na.rm = TRUE), .groups = "drop")
+
+fr_alloc_all_rules %>%
+  group_by(rule, lgd, lgd_name) %>%
+  summarise(total_fr_lgd = sum(fr_target, na.rm = TRUE), .groups = "drop") %>%
+  arrange(rule, desc(total_fr_lgd))
+
+fr_alloc_all_rules %>%
+  filter(grepl("within_LGD", rule)) %>%
+  group_by(rule, lgd, lgd_name) %>%
+  summarise(total_fr_lgd = sum(fr_target, na.rm = TRUE), .groups = "drop") %>%
+  arrange(rule, lgd)
+
+fixed_lgd_rules <- c(
+  "lambda_within_LGD",
+  "lambda_90_area_10_within_LGD",
+  "lambda_80_area_20_within_LGD",
+  "lambda_x_area_pow_0.25_within_LGD",
+  "lambda_x_log_area_within_LGD",
+  "random_within_LGD"
+)
+```
+
+
+10. Neurological state probabilities and cost inputs:
+```{r}
+# Neurological outcome probabilities
+p_no_mild <- 0.813
+p_moderate <- (1 - 0.813) * 0.837
+p_severe <- (1 - 0.813) * (1 - 0.837)
+
+# Utilities
+u_no_mild <- 0.8
+u_moderate <- 0.2
+u_severe <- 0.1
+
+# Costs (£)
+cost_scheme_5yr <- 474256
+cost_hosp_no_mild <- 34540
+cost_hosp_moderate <- 13040
+cost_hosp_severe <- 10154
+cost_weekly_moderate <- 398
+cost_weekly_severe <- 424
+cost_icd_yearly <- 6168
+```
+
+11. Constants for the simple Markov model for QALYs:
+```{r}
+# Simple Markov settings
+markov_horizon <- 40
+discount_rate <- 0.03
+
+# Dillenbeck et al. 2024 hazard ratios
+hr_no_mild <- 1.00
+hr_moderate <- 1.57
+hr_severe <- 2.46
+
+target_surv5_no_mild <- 0.738   # Dillenbeck CPC 1 five-year survival
+
+```
+
+12. Helper function for cost:
+```{r}
+simulate_cairns_qalys <- function(n_additional_lives,
+                                  study_months = 12,
+                                  utility = 0.72,
+                                  discount_rate = 0.03,
+                                  mean_survival_years = 5.61,
+                                  follow_months = 840) {
+  prob_month_alive <- exp(-1 / (mean_survival_years * 12))
+  total_qalys <- 0
+
+  if (n_additional_lives <= 0) return(0)
+
+  for (j in seq_len(n_additional_lives)) {
+    month_saved <- sample(0:study_months, 1)
+
+    # half-cycle correction in month of survival gain
+    qaly_j <- ((1 / 12) * utility) /
+      ((1 + discount_rate)^(month_saved / 12)) * 0.5
+
+    alive <- TRUE
+
+    for (m in seq_len(follow_months)) {
+      if (!alive) break
+
+      alive <- rbinom(1, 1, prob_month_alive) == 1
+
+      if (alive) {
+        qaly_j <- qaly_j +
+          ((1 / 12) * utility) /
+          ((1 + discount_rate)^((month_saved + m) / 12))
+      }
+    }
+
+    total_qalys <- total_qalys + qaly_j
+  }
+
+  total_qalys
+}
+```
+
+13. Precompute a sample of 50 FRs per datazone to sample from within the following function:
+```{r}
+set.seed(123)
+
+dz_all_main <- NI_shapefile %>%
+    sf::st_make_valid() %>%
+    dplyr::left_join(
+      zone_count %>% dplyr::select(zone_code, count, lgd, lgd_name),
+      by = "zone_code"
+    ) 
+
+zone_sf <- dz_all_main %>%
+  select(zone_code, geometry) %>%
+  distinct(zone_code, .keep_all = TRUE)
+
+zone_point_bank_list <- lapply(seq_len(nrow(zone_sf)), function(i) {
+  g <- st_geometry(zone_sf)[i]
+  z <- zone_sf$zone_code[i]
+
+  pts <- st_sample(g, size = 50)
+
+  if (length(pts) == 0) {
+    surf_pt <- st_point_on_surface(g)
+    pts <- st_sfc(rep(list(surf_pt[[1]]), 50), crs = st_crs(zone_sf))
+  } else {
+    pts <- st_sfc(pts, crs = st_crs(zone_sf))
+  }
+
+  st_sf(
+    zone_code = z,
+    point_id = seq_along(pts),
+    geometry = pts
+  )
+})
+
+zone_point_bank <- do.call(rbind, zone_point_bank_list)
+
+xy_bank <- st_coordinates(zone_point_bank)
+
+zone_point_bank <- zone_point_bank %>%
+  mutate(
+    home_x = xy_bank[, 1],
+    home_y = xy_bank[, 2]
+  ) %>%
+  st_drop_geometry()
+
+zone_point_bank %>%
+  count(zone_code) %>%
+  summarise(
+    min_points = min(n),
+    max_points = max(n),
+    mean_points = mean(n)
+  )
+```
+14. Helper functions for the main model/function
+
+14a. Helper functions for: Markov micro-sim, assigning age and calculating cost and QALYs
+```{r}
+sample_age_from_band <- function(age_band) {
+  dplyr::case_when(
+    age_band == "1 (0–4 years)"   ~ sample(0:4, 1),
+    age_band == "2 (5–9 years)"   ~ sample(5:9, 1),
+    age_band == "3 (10–14 years)" ~ sample(10:14, 1),
+    age_band == "4 (15–19 years)" ~ sample(15:19, 1),
+    age_band == "5 (20–24 years)" ~ sample(20:24, 1),
+    age_band == "6 (25–29 years)" ~ sample(25:29, 1),
+    age_band == "7 (30–34 years)" ~ sample(30:34, 1),
+    age_band == "8 (35–39 years)" ~ sample(35:39, 1),
+    age_band == "9 (40–44 years)" ~ sample(40:44, 1),
+    age_band == "10 (45–49 years)" ~ sample(45:49, 1),
+    age_band == "11 (50–54 years)" ~ sample(50:54, 1),
+    age_band == "12 (55–59 years)" ~ sample(55:59, 1),
+    age_band == "13 (60–64 years)" ~ sample(60:64, 1),
+    age_band == "14 (65–69 years)" ~ sample(65:69, 1),
+    age_band == "15 (70–74 years)" ~ sample(70:74, 1),
+    age_band == "16 (75–79 years)" ~ sample(75:79, 1),
+    age_band == "17 (80–84 years)" ~ sample(80:84, 1),
+    age_band == "18 (85–89 years)" ~ sample(85:89, 1),
+    age_band == "19 (90+ years)"   ~ sample(90:100, 1),
+    TRUE ~ 60L
+  )
+}
+
+get_year_surv <- function(age_val, sex_val, life_table_yearly) {
+  out <- life_table_yearly %>%
+    filter(age == age_val, gender == sex_val) %>%
+    pull(year_surv_rate)
+
+  if (length(out) == 0 || is.na(out)) return(0.5)
+  out
+}
+
+simulate_markov_micro <- function(age_band,
+                                  gender,
+                                  neuro_status,
+                                  life_table_yearly,
+                                  discount_rate = 0.03,
+                                  horizon_years = 40,
+                                  target_surv5_no_mild = 0.738,
+                                  hr_no_mild = 1.00,
+                                  hr_moderate = 1.57,
+                                  hr_severe = 2.46,
+                                  u_no_mild,
+                                  u_moderate,
+                                  u_severe,
+                                  cost_hosp_no_mild,
+                                  cost_hosp_moderate,
+                                  cost_hosp_severe,
+                                  cost_weekly_moderate,
+                                  cost_weekly_severe,
+                                  cost_icd_yearly) {
+
+  age_start <- sample_age_from_band(age_band)
+
+  utility <- dplyr::case_when(
+    neuro_status == "no_mild" ~ u_no_mild,
+    neuro_status == "moderate" ~ u_moderate,
+    neuro_status == "severe" ~ u_severe,
+    TRUE ~ 0
+  )
+
+  annual_cost <- dplyr::case_when(
+    neuro_status == "no_mild" ~ cost_icd_yearly,
+    neuro_status == "moderate" ~ 52 * cost_weekly_moderate,
+    neuro_status == "severe" ~ 52 * cost_weekly_severe,
+    TRUE ~ 0
+  )
+
+  hosp_cost <- dplyr::case_when(
+    neuro_status == "no_mild" ~ cost_hosp_no_mild,
+    neuro_status == "moderate" ~ cost_hosp_moderate,
+    neuro_status == "severe" ~ cost_hosp_severe,
+    TRUE ~ 0
+  )
+
+  hr_state <- dplyr::case_when(
+    neuro_status == "no_mild" ~ hr_no_mild,
+    neuro_status == "moderate" ~ hr_moderate,
+    neuro_status == "severe" ~ hr_severe,
+    TRUE ~ 1
+  )
+
+  # Calibrate a fixed post-arrest excess hazard at baseline so the no/mild group matches Dillenbeck's 5-year survival for CPC 1.
+  base_surv5_start <- prod(sapply(0:4, function(k) {
+    get_year_surv(min(age_start + k, 100L), gender, life_table_yearly)
+  }))
+
+  hr_post_arrest <- log(target_surv5_no_mild) / log(pmax(base_surv5_start, 1e-6))
+  hr_post_arrest <- max(hr_post_arrest, 1)
+
+  qaly <- 0
+  cost <- hosp_cost
+  alive <- TRUE
+
+  for (t in seq_len(horizon_years)) {
+    if (!alive) break
+
+    age_t <- min(age_start + (t - 1), 100L)
+    base_surv_t <- get_year_surv(age_t, gender, life_table_yearly)
+
+    p_surv_year <- base_surv_t^(hr_post_arrest * hr_state)
+    disc <- 1 / ((1 + discount_rate)^(t - 1))
+
+    survive_full_year <- rbinom(1, 1, p_surv_year) == 1
+    year_weight <- ifelse(survive_full_year, 1, 0.5)  # half-cycle correction
+
+    qaly <- qaly + utility * disc * year_weight
+    cost <- cost + annual_cost * disc * year_weight
+
+    alive <- survive_full_year
+  }
+
+  c(qaly_gain = qaly, survivor_cost = cost)
+}
+```
+
+
+14b. Helper function to subset simulations nicely:
+```{r}
+subset_first_sims <- function(df, n_sims) {
+  sims_keep <- sort(unique(df$sim))[seq_len(min(n_sims, n_distinct(df$sim)))]
+  df %>%
+    dplyr::filter(sim %in% sims_keep)
+}
+```
+
+
+14c. Helper to combine results from 5 different simulations into 1, representing 5 years:
+```{r}
+make_five_year_blocks <- function(sim_level_df, scheme_cost_is_already_5yr = TRUE) {
+  
+  sim_lookup <- tibble::tibble(
+    sim = sort(unique(sim_level_df$sim)),
+    sim_index = seq_along(sort(unique(sim_level_df$sim)))
+  ) %>%
+    dplyr::mutate(block_id = ceiling(sim_index / 5))
+
+  sim_level_df %>%
+    dplyr::left_join(sim_lookup, by = "sim") %>%
+    dplyr::group_by(block_id) %>%
+    dplyr::summarise(
+      n_years_in_block = dplyr::n_distinct(sim),
+      lives_saved_5yr = sum(sim_lives_saved_year, na.rm = TRUE),
+      qalys_5yr = sum(sim_qalys_year, na.rm = TRUE),
+      survivor_cost_5yr = sum(sim_survivor_cost_year, na.rm = TRUE),
+      scheme_cost_5yr = if (scheme_cost_is_already_5yr) {
+        dplyr::first(sim_scheme_cost_year)
+      } else {
+        sum(sim_scheme_cost_year, na.rm = TRUE)
+      },
+      total_cost_5yr = scheme_cost_5yr + survivor_cost_5yr,
+      icer_5yr = ifelse(qalys_5yr > 0, total_cost_5yr / qalys_5yr, NA_real_),
+      .groups = "drop"
+    )
+}
+```
+
+14.d Helper to generate FR allocations per sim for the random rules e.g random across NI:
+```{r}
+set.seed(123)
+
+random_zone_assignments <- sample(
+  alloc_base$zone_code,
+  size = total_vol_ni,
+  replace = TRUE
+)
+
+fr_alloc_random_across_NI_true <- tibble(zone_code = random_zone_assignments) %>%
+  count(zone_code, name = "fr_target") %>%
+  right_join(alloc_base, by = "zone_code") %>%
+  mutate(
+    fr_target = ifelse(is.na(fr_target), 0L, fr_target),
+    rule = "random_across_NI_true"
+  )
+
+make_random_within_lgd_alloc <- function(alloc_base, fr_per_lgd = 31) {
+  alloc_base %>%
+    dplyr::group_by(lgd) %>%
+    dplyr::mutate(
+      score = 1,
+      raw_target = fr_per_lgd / dplyr::n(),
+      fr_target = floor(raw_target),
+      remainder = raw_target - fr_target
+    ) %>%
+    dplyr::group_modify(~{
+      d <- .x
+      n_left <- fr_per_lgd - sum(d$fr_target, na.rm = TRUE)
+      if (n_left > 0) {
+        add_idx <- sample(seq_len(nrow(d)), size = n_left)
+        d$fr_target[add_idx] <- d$fr_target[add_idx] + 1
+      }
+      d
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(rule = "random_within_LGD")
+}
+
+make_random_across_ni_alloc <- function(alloc_base, total_vol_ni = 806) {
+  random_zone_assignments <- sample(
+    alloc_base$zone_code,
+    size = total_vol_ni,
+    replace = TRUE
+  )
+
+  tibble::tibble(zone_code = random_zone_assignments) %>%
+    dplyr::count(zone_code, name = "fr_target") %>%
+    dplyr::right_join(alloc_base, by = "zone_code") %>%
+    dplyr::mutate(
+      fr_target = ifelse(is.na(fr_target), 0L, fr_target),
+      rule = "random_across_NI"
+    )
+}
+
+
+generate_random_allocations_by_sim <- function(rule_name,  #here
+                                               alloc_base,
+                                               sim_ids,
+                                               total_vol_ni = 806,
+                                               fr_per_lgd = 31,
+                                               seed = 1) {
+
+  out <- vector("list", length(sim_ids))
+  names(out) <- as.character(sim_ids)
+
+  for (i in seq_along(sim_ids)) {
+    set.seed(seed + i)
+
+    out[[i]] <- switch(
+      rule_name,
+      "random_within_LGD" = make_random_within_lgd_alloc(
+        alloc_base = alloc_base,
+        fr_per_lgd = fr_per_lgd
+      ),
+      "random_across_NI" = make_random_across_ni_alloc(
+        alloc_base = alloc_base,
+        total_vol_ni = total_vol_ni
+      ),
+      stop("generate_random_allocations_by_sim() only supports random rules.")
+    )
+  }
+
+  out
+}
+```
+
+14.e Helper for FR response:
+```{r}
+process_week_fr <- function(w,
+                            df_sim,
+                            volunteers,
+                            n_cohorts,
+                            radius_m,
+                            p_respond,
+                            k_decay,
+                            dispatch_sens,
+                            p_gear) {
+
+  A <- df_sim %>% dplyr::filter(week == w)
+  if (nrow(A) == 0) return(NULL)
+
+  active_cohort <- ((w - 1) %% n_cohorts) + 1
+  R <- volunteers %>% dplyr::filter(cohort == active_cohort)
+  if (nrow(R) == 0) return(NULL)
+
+  dx <- outer(A$coa_easting, R$home_x, "-")
+  dy <- outer(A$coa_northing, R$home_y, "-")
+  dist_m_mat <- sqrt(dx^2 + dy^2)
+
+  within_idx <- which(dist_m_mat <= radius_m, arr.ind = TRUE)
+  if (nrow(within_idx) == 0) return(NULL)
+
+  pairs <- tibble::tibble(
+    arrest_row_local = within_idx[, 1],
+    responder_row_local = within_idx[, 2],
+    dist_m = dist_m_mat[within_idx]
+  ) %>%
+    dplyr::mutate(
+      dist_miles = dist_m / 1609.344,
+      p_resp_dist = p_respond * exp(-k_decay * dist_miles),
+      p_resp_dist = pmin(pmax(p_resp_dist, 0), 1),
+      sim_row_id = A$sim_row_id[arrest_row_local],
+      volunteer_id = R$volunteer_id[responder_row_local],
+      week = w
+    )
+
+  # dispatch applied ONCE per arrest
+  dispatch_by_event <- tibble::tibble(
+    sim_row_id = sort(unique(pairs$sim_row_id)),
+    dispatched = rbinom(length(unique(pairs$sim_row_id)), 1, dispatch_sens)
+  )
+
+  pairs <- pairs %>%
+    dplyr::left_join(dispatch_by_event, by = "sim_row_id") %>%
+    dplyr::mutate(
+      got_gear = ifelse(dispatched == 1, rbinom(dplyr::n(), 1, p_gear), 0),
+      responded = ifelse(got_gear == 1, rbinom(dplyr::n(), 1, p_resp_dist), 0)
+    )
+
+  pairs
+}
+```
+
+
+*Main function that runs everything per LGD* 
+
+15. Function that runs the simulation across all LGDs based on a FR allocation scheme, assigning neurological impairment etc, calculates QALY and other metrics, and then calculates cost:
+```{r}
+#Checklist of helpers before running:
+exists("process_week_fr")
+exists("make_random_within_lgd_alloc")
+exists("make_random_across_ni_alloc")
+exists("generate_random_allocations_by_sim")
+exists("run_rule_lgd")
+
+run_one_lgd_vary_qaly <- function(target_lgd,
+                                  df2, zone_count, NI_shapefile, fr_alloc = NULL,
+                                  fr_alloc_by_sim = NULL,
+                                  zone_point_bank,
+                                  life_table_yearly,
+                                  weeks = 52, rota_len = 4,
+                                  radius_miles = 15,
+                                  p_gear = 0.8, p_respond = 0.3, dispatch_sens = 0.4,
+                                  k_decay = 0.1,
+                                  b0 = 1.8790657182, b1 = 0.2971864133,
+                                  b2 = 0.2934664770, sigma = 0.2983923496,
+                                  discount_rate = 0.03,
+                                  markov_horizon = 70,
+                                  target_surv5_no_mild = 0.738,
+                                  hr_no_mild = 1.00,
+                                  hr_moderate = 1.57,
+                                  hr_severe = 2.46,
+                                  u_no_mild,
+                                  u_moderate,
+                                  u_severe,
+                                  cost_scheme_5yr,
+                                  cost_hosp_no_mild,
+                                  cost_hosp_moderate,
+                                  cost_hosp_severe,
+                                  cost_weekly_moderate,
+                                  cost_weekly_severe,
+                                  cost_icd_yearly,
+                                  p_no_mild,
+                                  p_moderate,
+                                  p_severe,
+                                  seed = 1,
+                                  return_sim_level = FALSE,
+                                  max_sims = NULL) {
+
+  # a) Setup
+  set.seed(seed)
+  radius_m <- radius_miles * 1609.344
+
+  # b) Build LGD base zone table WITHOUT attaching FR targets yet
+  #    FR counts are attached inside each simulation year so that
+  #    simulation-specific random allocations can be supported.
+  dz_w <- dz_all_main %>%
+    dplyr::filter(lgd == target_lgd) %>%
+    dplyr::mutate(
+      count = ifelse(is.na(count) | count < 0, 0, count)
+    ) %>%
+    dplyr::filter(count > 0)
+
+  lgd_population <- sum(dz_w$count, na.rm = TRUE)
+  lgd_area_km2 <- if (nrow(dz_w) > 0) {
+    as.numeric(sf::st_area(sf::st_union(dz_w$geometry))) / 1e6
+  } else {
+    NA_real_
+  }
+
+  if (nrow(dz_w) == 0) {
+    empty_out <- tibble::tibble(
+      lgd_code = target_lgd,
+      lgd_name = NA_character_,
+      lgd_population = 0,
+      lgd_area_km2 = NA_real_,
+      n_arrests = 0L,
+      n_vol = 0L,
+      n_per_week = 0L,
+      total_lives_saved = 0,
+      total_qalys_gained = 0,
+      total_survivor_cost = 0,
+      avg_ambulance_time = NA_real_,
+      avg_ambulance_plus_FR_time = NA_real_,
+      mean_lives_saved_per_year = NA_real_,
+      mean_qalys_gained_per_year = NA_real_,
+      mean_survivor_cost_per_year = NA_real_,
+      mean_scheme_cost_per_year = NA_real_,
+      mean_total_cost_per_year = NA_real_,
+      mean_icer = NA_real_,
+      icer_from_means = NA_real_,
+      mean_surv_base_year = NA_real_,
+      mean_surv_FR_year = NA_real_
+    )
+
+    if (return_sim_level) {
+      return(list(summary = empty_out, sim_level = tibble::tibble()))
+    } else {
+      return(empty_out)
+    }
+  }
+
+  # c) Baseline arrests in this LGD
+  df_lgd <- df2 %>%
+    dplyr::filter(lgd == target_lgd)
+
+  if (!is.null(max_sims)) {
+    sims_keep <- sort(unique(df_lgd$sim))[seq_len(min(max_sims, dplyr::n_distinct(df_lgd$sim)))]
+    df_lgd <- df_lgd %>%
+      dplyr::filter(sim %in% sims_keep)
+  }
+
+  if (nrow(df_lgd) == 0) {
+    empty_out <- tibble::tibble(
+      lgd_code = target_lgd,
+      lgd_name = dplyr::first(dz_w$lgd_name),
+      lgd_population = lgd_population,
+      lgd_area_km2 = lgd_area_km2,
+      n_arrests = 0L,
+      n_vol = NA_real_,
+      n_per_week = NA_real_,
+      total_lives_saved = 0,
+      total_qalys_gained = 0,
+      total_survivor_cost = 0,
+      avg_ambulance_time = NA_real_,
+      avg_ambulance_plus_FR_time = NA_real_,
+      mean_lives_saved_per_year = NA_real_,
+      mean_qalys_gained_per_year = NA_real_,
+      mean_survivor_cost_per_year = NA_real_,
+      mean_scheme_cost_per_year = NA_real_,
+      mean_total_cost_per_year = NA_real_,
+      mean_icer = NA_real_,
+      icer_from_means = NA_real_,
+      mean_surv_base_year = NA_real_,
+      mean_surv_FR_year = NA_real_
+    )
+
+    if (return_sim_level) {
+      return(list(summary = empty_out, sim_level = tibble::tibble()))
+    } else {
+      return(empty_out)
+    }
+  }
+
+  if (!"sim" %in% names(df_lgd)) {
+    stop("df2 must contain a 'sim' column.")
+  }
+
+  sim_ids <- sort(unique(df_lgd$sim))
+
+  # d) Run one simulated year at a time
+  sim_results <- lapply(seq_along(sim_ids), function(ii) {
+    sim_id <- sim_ids[ii]
+    set.seed(seed + ii)
+
+    df_sim <- df_lgd %>%
+      dplyr::filter(sim == sim_id) %>%
+      dplyr::mutate(
+        week = sample(1:weeks, size = dplyr::n(), replace = TRUE),
+        sim_row_id = dplyr::row_number()
+      )
+
+    if (nrow(df_sim) == 0) {
+      return(tibble::tibble())
+    }
+
+    # e) Attach simulation-specific FR allocation
+    if (!is.null(fr_alloc_by_sim)) {
+
+      fr_alloc_sim <- fr_alloc_by_sim[[as.character(sim_id)]]
+
+      if (is.null(fr_alloc_sim)) {
+        stop(paste("No fr_alloc_by_sim entry found for sim", sim_id))
+      }
+
+      fr_alloc_small_sim <- fr_alloc_sim %>%
+        dplyr::ungroup() %>%
+        dplyr::transmute(zone_code, fr_target)
+
+    } else {
+
+      if (is.null(fr_alloc)) {
+        stop("Either fr_alloc or fr_alloc_by_sim must be supplied.")
+      }
+
+      fr_alloc_small_sim <- fr_alloc %>%
+        dplyr::ungroup() %>%
+        dplyr::transmute(zone_code, fr_target)
+    }
+
+    fr_counts_sim <- dz_w %>%
+      sf::st_drop_geometry() %>%
+      dplyr::select(zone_code) %>%
+      dplyr::left_join(fr_alloc_small_sim, by = "zone_code") %>%
+      dplyr::mutate(
+        fr_target = ifelse(is.na(fr_target), 0L, fr_target)
+      )
+
+    n_vol_sim <- sum(fr_counts_sim$fr_target, na.rm = TRUE)
+    n_cohorts_sim <- ifelse(n_vol_sim < rota_len, 1, rota_len)
+    n_per_week_sim <- ceiling(n_vol_sim / n_cohorts_sim)
+
+    # f) Fresh FR roster/home points for this simulation year
+    if (n_vol_sim > 0) {
+      vol <- fr_counts_sim %>%
+        tidyr::uncount(fr_target) %>%
+        dplyr::mutate(
+          volunteer_id = dplyr::row_number(),
+          cohort = rep(1:n_cohorts_sim, length.out = dplyr::n())
+        )
+
+      volunteers <- vol %>%
+        dplyr::left_join(zone_point_bank, by = "zone_code") %>%
+        dplyr::group_by(volunteer_id, cohort, zone_code) %>%
+        dplyr::slice_sample(n = 1) %>%
+        dplyr::ungroup() %>%
+        dplyr::select(volunteer_id, cohort, zone_code, home_x, home_y)
+
+      if (any(is.na(volunteers$home_x)) || any(is.na(volunteers$home_y))) {
+        stop("Missing home coordinates after joining zone_point_bank.")
+      }
+    }
+
+    # g) Weekly FR paging and response using external helper
+    if (n_vol_sim == 0) {
+      df_best <- df_sim %>% dplyr::mutate(t_best = T_sim)
+
+    } else {
+
+      pair_results <- dplyr::bind_rows(
+        lapply(
+          sort(unique(df_sim$week)),
+          process_week_fr,
+          df_sim = df_sim,
+          volunteers = volunteers,
+          n_cohorts = n_cohorts_sim,
+          radius_m = radius_m,
+          p_respond = p_respond,
+          k_decay = k_decay,
+          dispatch_sens = dispatch_sens,
+          p_gear = p_gear
+        )
+      )
+
+      if (is.null(pair_results) || nrow(pair_results) == 0) {
+        df_best <- df_sim %>% dplyr::mutate(t_best = T_sim)
+
+      } else {
+        responded_long <- pair_results %>%
+          dplyr::filter(responded == 1) %>%
+          dplyr::left_join(
+            df_sim %>% dplyr::select(sim_row_id, Urban_status),
+            by = "sim_row_id"
+          ) %>%
+          dplyr::mutate(
+            dist_for_log = pmax(dist_miles, 1e-6),
+            mu_fr = b0 + b1 * log(dist_for_log) + b2 * Urban_status,
+            u = runif(dplyr::n()),
+            FR_time = exp(mu_fr + sigma * qlogis(u))
+          )
+
+        fr_best <- responded_long %>%
+          dplyr::group_by(sim_row_id) %>%
+          dplyr::summarise(fr_time_min = min(FR_time), .groups = "drop")
+
+        df_best <- df_sim %>%
+          dplyr::left_join(fr_best, by = "sim_row_id") %>%
+          dplyr::mutate(
+            fr_time_min = ifelse(is.na(fr_time_min), Inf, fr_time_min),
+            t_best = pmin(T_sim, fr_time_min)
+          )
+      }
+    }
+
+    # h) Survival comparison for this simulated year
+    comparison <- df_sim %>%
+      dplyr::select(sim_row_id, sim, age_band, gender, T0 = T_sim) %>%
+      dplyr::inner_join(
+        df_best %>% dplyr::select(sim_row_id, T1 = t_best),
+        by = "sim_row_id"
+      ) %>%
+      dplyr::mutate(U_surv = runif(dplyr::n())) %>%
+      dplyr::mutate(
+        IDEFIB0 = T0 + 1,
+        ICPR0   = T0 + 2,
+        p_base = plogis(-0.260 - 0.106 * ICPR0 - 0.139 * IDEFIB0),
+        IDEFIB1 = T1 + 1,
+        ICPR1   = T1 + 2,
+        p_FR = plogis(-0.260 - 0.106 * ICPR1 - 0.139 * IDEFIB1),
+        y_base = as.integer(U_surv < p_base),
+        y_FR   = as.integer(U_surv < p_FR),
+        dy = y_FR - y_base
+      ) %>%
+      dplyr::mutate(
+        neuro_status = NA_character_,
+        qaly_gain = 0,
+        survivor_cost = 0
+      )
+
+    # i) Assign neurological state and run microsimulation only for incremental survivors
+    idx <- which(comparison$dy == 1)
+
+    if (length(idx) > 0) {
+      comparison$neuro_status[idx] <- sample(
+        c("no_mild", "moderate", "severe"),
+        size = length(idx),
+        replace = TRUE,
+        prob = c(p_no_mild, p_moderate, p_severe)
+      )
+
+      micro_out <- t(vapply(idx, function(j) {
+        simulate_markov_micro(
+          age_band = comparison$age_band[j],
+          gender = comparison$gender[j],
+          neuro_status = comparison$neuro_status[j],
+          life_table_yearly = life_table_yearly,
+          discount_rate = discount_rate,
+          horizon_years = markov_horizon,
+          target_surv5_no_mild = target_surv5_no_mild,
+          hr_no_mild = hr_no_mild,
+          hr_moderate = hr_moderate,
+          hr_severe = hr_severe,
+          u_no_mild = u_no_mild,
+          u_moderate = u_moderate,
+          u_severe = u_severe,
+          cost_hosp_no_mild = cost_hosp_no_mild,
+          cost_hosp_moderate = cost_hosp_moderate,
+          cost_hosp_severe = cost_hosp_severe,
+          cost_weekly_moderate = cost_weekly_moderate,
+          cost_weekly_severe = cost_weekly_severe,
+          cost_icd_yearly = cost_icd_yearly
+        )
+      }, numeric(2)))
+
+      comparison$qaly_gain[idx] <- micro_out[, "qaly_gain"]
+      comparison$survivor_cost[idx] <- micro_out[, "survivor_cost"]
+    }
+
+    # j) Summarise this simulated year
+    sim_lives_saved_year <- sum(comparison$dy, na.rm = TRUE)
+    sim_qalys_year <- sum(comparison$qaly_gain, na.rm = TRUE)
+    sim_survivor_cost_year <- sum(comparison$survivor_cost, na.rm = TRUE)
+
+    # yearly mean predicted survival rates
+    sim_surv_base_year <- mean(comparison$p_base, na.rm = TRUE)
+    sim_surv_FR_year   <- mean(comparison$p_FR,   na.rm = TRUE)
+
+    scheme_cost_5yr_lgd <- cost_scheme_5yr
+    scheme_cost_per_year_lgd <- scheme_cost_5yr_lgd
+
+    sim_total_cost_year <- scheme_cost_per_year_lgd + sim_survivor_cost_year
+    sim_icer <- ifelse(sim_qalys_year > 0,
+                       sim_total_cost_year / sim_qalys_year,
+                       NA_real_)
+
+    tibble::tibble(
+      sim = sim_id,
+      n_arrests = nrow(comparison),
+      n_vol = n_vol_sim,
+      n_per_week = n_per_week_sim,
+      avg_ambulance_time = mean(comparison$T0, na.rm = TRUE),
+      avg_ambulance_plus_FR_time = mean(comparison$T1, na.rm = TRUE),
+      sim_surv_base_year = sim_surv_base_year,
+      sim_surv_FR_year = sim_surv_FR_year,
+      sim_lives_saved_year = sim_lives_saved_year,
+      sim_qalys_year = sim_qalys_year,
+      sim_survivor_cost_year = sim_survivor_cost_year,
+      sim_scheme_cost_year = scheme_cost_per_year_lgd,
+      sim_total_cost_year = sim_total_cost_year,
+      sim_icer = sim_icer
+    )
+  })
+
+  # k) Bind yearly results across simulations
+  by_year <- dplyr::bind_rows(sim_results)
+  
+  q025 <- function(x) stats::quantile(x, 0.025, na.rm = TRUE, names = FALSE)
+  q975 <- function(x) stats::quantile(x, 0.975, na.rm = TRUE, names = FALSE)
+
+  # l) LGD-level summary
+  summary_out <- tibble::tibble(
+  lgd_code = target_lgd,
+  lgd_name = dplyr::first(dz_w$lgd_name),
+  lgd_population = lgd_population,
+  lgd_area_km2 = lgd_area_km2,
+  n_arrests = sum(by_year$n_arrests, na.rm = TRUE),
+  n_vol = mean(by_year$n_vol, na.rm = TRUE),
+  n_per_week = mean(by_year$n_per_week, na.rm = TRUE),
+
+  total_lives_saved = sum(by_year$sim_lives_saved_year, na.rm = TRUE),
+  total_qalys_gained = sum(by_year$sim_qalys_year, na.rm = TRUE),
+  total_survivor_cost = sum(by_year$sim_survivor_cost_year, na.rm = TRUE),
+
+  avg_ambulance_time = mean(by_year$avg_ambulance_time, na.rm = TRUE),
+  avg_ambulance_plus_FR_time = mean(by_year$avg_ambulance_plus_FR_time, na.rm = TRUE),
+
+  mean_surv_base_year = mean(by_year$sim_surv_base_year, na.rm = TRUE),
+  mean_surv_base_year_lo = q025(by_year$sim_surv_base_year),
+  mean_surv_base_year_hi = q975(by_year$sim_surv_base_year),
+
+  mean_surv_FR_year = mean(by_year$sim_surv_FR_year, na.rm = TRUE),
+  mean_surv_FR_year_lo = q025(by_year$sim_surv_FR_year),
+  mean_surv_FR_year_hi = q975(by_year$sim_surv_FR_year),
+
+  mean_lives_saved_per_year = mean(by_year$sim_lives_saved_year, na.rm = TRUE),
+  mean_lives_saved_per_year_lo = q025(by_year$sim_lives_saved_year),
+  mean_lives_saved_per_year_hi = q975(by_year$sim_lives_saved_year),
+
+  mean_qalys_gained_per_year = mean(by_year$sim_qalys_year, na.rm = TRUE),
+  mean_qalys_gained_per_year_lo = q025(by_year$sim_qalys_year),
+  mean_qalys_gained_per_year_hi = q975(by_year$sim_qalys_year),
+
+  mean_survivor_cost_per_year = mean(by_year$sim_survivor_cost_year, na.rm = TRUE),
+  mean_survivor_cost_per_year_lo = q025(by_year$sim_survivor_cost_year),
+  mean_survivor_cost_per_year_hi = q975(by_year$sim_survivor_cost_year),
+
+  mean_scheme_cost_per_year = mean(by_year$sim_scheme_cost_year, na.rm = TRUE),
+  mean_scheme_cost_per_year_lo = q025(by_year$sim_scheme_cost_year),
+  mean_scheme_cost_per_year_hi = q975(by_year$sim_scheme_cost_year),
+
+  mean_total_cost_per_year = mean(by_year$sim_total_cost_year, na.rm = TRUE),
+  mean_total_cost_per_year_lo = q025(by_year$sim_total_cost_year),
+  mean_total_cost_per_year_hi = q975(by_year$sim_total_cost_year),
+
+  mean_icer = mean(by_year$sim_icer, na.rm = TRUE),
+  mean_icer_lo = q025(by_year$sim_icer),
+  mean_icer_hi = q975(by_year$sim_icer),
+
+  icer_from_means = mean(by_year$sim_total_cost_year, na.rm = TRUE) /
+    mean(by_year$sim_qalys_year, na.rm = TRUE),
+
+  avg_ambulance_time_lo = q025(by_year$avg_ambulance_time),
+  avg_ambulance_time_hi = q975(by_year$avg_ambulance_time),
+
+  avg_ambulance_plus_FR_time_lo = q025(by_year$avg_ambulance_plus_FR_time),
+  avg_ambulance_plus_FR_time_hi = q975(by_year$avg_ambulance_plus_FR_time)
+)
+  
+  #Nice and pretty output
+  summary_out <- summary_out %>%
+  dplyr::mutate(
+    lives_saved_display = sprintf(
+      "%.2f (%.2f, %.2f)",
+      mean_lives_saved_per_year,
+      mean_lives_saved_per_year_lo,
+      mean_lives_saved_per_year_hi
+    ),
+    qalys_display = sprintf(
+      "%.2f (%.2f, %.2f)",
+      mean_qalys_gained_per_year,
+      mean_qalys_gained_per_year_lo,
+      mean_qalys_gained_per_year_hi
+    ),
+    total_cost_display = sprintf(
+      "£%s (£%s, £%s)",
+      format(round(mean_total_cost_per_year, 0), big.mark = ","),
+      format(round(mean_total_cost_per_year_lo, 0), big.mark = ","),
+      format(round(mean_total_cost_per_year_hi, 0), big.mark = ",")
+    ),
+    icer_display = sprintf(
+      "£%s (£%s, £%s)",
+      format(round(mean_icer, 0), big.mark = ","),
+      format(round(mean_icer_lo, 0), big.mark = ","),
+      format(round(mean_icer_hi, 0), big.mark = ",")
+    )
+  )
+
+  if (return_sim_level) {
+    sim_out <- by_year %>%
+      dplyr::mutate(
+        lgd_code = target_lgd,
+        lgd_name = dplyr::first(dz_w$lgd_name)
+      )
+    return(list(summary = summary_out, sim_level = sim_out))
+  } else {
+    return(summary_out)
+  }
+}
+```
+
+
+Common arguments for this function:
+```{r}
+
+
+lgds <- sort(unique(zone_count$lgd))
+all_rules <- unique(fr_alloc_all_rules$rule)
+
+main_rules <- c(
+  "lambda_across_NI",
+  "lambda_within_LGD",
+  "random_within_LGD"
+)
+
+common_args <- list(
+  zone_count = zone_count,
+  NI_shapefile = NI_shapefile,
+  zone_point_bank = zone_point_bank,
+  life_table_yearly = life_table_yearly,
+  weeks = 52,
+  rota_len = 4,
+  radius_miles = 15,
+  p_gear = 0.8,
+  p_respond = 0.3,
+  dispatch_sens = 0.4,
+  k_decay = 0.1,
+  b0 = 1.8790657182,
+  b1 = 0.2971864133,
+  b2 = 0.2934664770,
+  sigma = 0.2983923496,
+  discount_rate = 0.03,
+  markov_horizon = 70,
+  target_surv5_no_mild = 0.738,
+  hr_no_mild = 1.00,
+  hr_moderate = 1.57,
+  hr_severe = 2.46,
+  u_no_mild = u_no_mild,
+  u_moderate = u_moderate,
+  u_severe = u_severe,
+  cost_scheme_5yr = cost_scheme_5yr,
+  cost_hosp_no_mild = cost_hosp_no_mild,
+  cost_hosp_moderate = cost_hosp_moderate,
+  cost_hosp_severe = cost_hosp_severe,
+  cost_weekly_moderate = cost_weekly_moderate,
+  cost_weekly_severe = cost_weekly_severe,
+  cost_icd_yearly = cost_icd_yearly,
+  p_no_mild = p_no_mild,
+  p_moderate = p_moderate,
+  p_severe = p_severe
+)
+
+run_rule_lgd <- function(rule_name, target_lgd, df2_use, seed,
+                         return_sim_level = FALSE,
+                         max_sims = NULL) {
+
+  sims_use <- sort(unique(df2_use$sim))
+  if (!is.null(max_sims)) {
+    sims_use <- sims_use[seq_len(min(max_sims, length(sims_use)))]
+  }
+
+  df2_use <- df2_use %>%
+    dplyr::filter(sim %in% sims_use)
+
+  if (rule_name %in% c("random_within_LGD", "random_across_NI")) {
+
+    fr_alloc_by_sim <- generate_random_allocations_by_sim(
+      rule_name = rule_name,
+      alloc_base = alloc_base,
+      sim_ids = sims_use,
+      total_vol_ni = total_vol_ni,
+      fr_per_lgd = 31,
+      seed = seed
+    )
+
+    do.call(
+      run_one_lgd_vary_qaly,
+      c(
+        list(
+          target_lgd = target_lgd,
+          df2 = df2_use,
+          fr_alloc = NULL,
+          fr_alloc_by_sim = fr_alloc_by_sim,
+          seed = seed,
+          return_sim_level = return_sim_level,
+          max_sims = max_sims
+        ),
+        common_args
+      )
+    )
+
+  } else {
+
+    fr_alloc_rule <- fr_alloc_all_rules %>%
+      dplyr::filter(rule == rule_name)
+
+    do.call(
+      run_one_lgd_vary_qaly,
+      c(
+        list(
+          target_lgd = target_lgd,
+          df2 = df2_use,
+          fr_alloc = fr_alloc_rule,
+          fr_alloc_by_sim = NULL,
+          seed = seed,
+          return_sim_level = return_sim_level,
+          max_sims = max_sims
+        ),
+        common_args
+      )
+    )
+  }
+}
+```
+
+
+16. Testing the function for a single LGD (Fermanagh) + CE plane:
+```{r warning=FALSE}
+df2_200 <- subset_first_sims(df2, 200)
+
+fermanagh_rule <- "lambda_within_LGD"
+
+system.time({
+  test_ferm_200 <- run_rule_lgd(
+    rule_name = fermanagh_rule,
+    target_lgd = "95PP",
+    df2_use = df2,
+    seed = 123,
+    return_sim_level = TRUE,
+    max_sims = 1000
+  )
+})
+
+test_ferm_200$summary
+head(test_ferm_200$sim_level)
+
+ferm_5yr_blocks <- make_five_year_blocks(test_ferm_200$sim_level)
+ferm_5yr_blocks
+
+threshold_lines <- tibble(
+  threshold = c("£20,000", "£30,000", "£35,000"),
+  slope = c(20000, 30000, 35000),
+  intercept = 0
+)
+
+ggplot(ferm_5yr_blocks, aes(x = qalys_5yr, y = total_cost_5yr)) +
+  geom_point(alpha = 0.5, colour = "#3FA9E2", size = 2.5) +
+  geom_abline(
+    data = threshold_lines,
+    aes(slope = slope, intercept = intercept, colour = threshold, linetype = threshold),
+    linewidth = 0.6
+  ) +
+  scale_colour_manual(
+    name = NULL,
+    values = c(
+      "£20,000" = "#D55E00",
+      "£30,000" = "#0072B2",
+      "£35,000" = "#7B3294"
+    )
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "£20,000" = "longdash",
+      "£30,000" = "longdash",
+      "£35,000" = "longdash"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::label_dollar(prefix = "£", big.mark = ",")
+  ) +
+  labs(
+    x = "Incremental QALYs gained over 5 years",
+    y = "Incremental total cost over 5 years (£)",
+    title = "Cost-effectiveness plane: Fermanagh FRs assigned weighted by expected SCAs"
+  ) +
+  guides(
+    colour = guide_legend(nrow = 1),
+    linetype = "none"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+```
+
+
+17a. Run each LGD for 20 simulations as a screening run to see what performs best (Not final CE analysis, just to see which performs best without waiting ages):
+
+```{r warning=FALSE}
+df2_20 <- subset_first_sims(df2, 20)
+
+results_all_rules_lgd_20 <- bind_rows(lapply(seq_along(all_rules), function(r) {
+
+  rule_name <- all_rules[r]
+
+  bind_rows(lapply(seq_along(lgds), function(i) {
+    run_rule_lgd(
+      rule_name = rule_name,
+      target_lgd = lgds[i],
+      df2_use = df2_20,
+      seed = 10000 + 100 * r + i,
+      return_sim_level = FALSE,
+      max_sims = 20
+    ) %>%
+      dplyr::mutate(rule = rule_name)
+  }))
+
+}))
+
+#Summarise across NI:
+results_all_rules_summary_20 <- results_all_rules_lgd_20 %>%
+  dplyr::group_by(rule) %>%
+  dplyr::summarise(
+    total_fr_ni = sum(n_vol, na.rm = TRUE),
+    total_arrests = sum(n_arrests, na.rm = TRUE),
+    mean_arrests_per_year_ni = sum(n_arrests, na.rm = TRUE) / 20,
+    mean_lives_saved_per_year_ni = sum(mean_lives_saved_per_year, na.rm = TRUE),
+    mean_qalys_gained_per_year_ni = sum(mean_qalys_gained_per_year, na.rm = TRUE),
+    mean_survivor_cost_per_year_ni = sum(mean_survivor_cost_per_year, na.rm = TRUE),
+    mean_scheme_cost_per_year_ni = sum(mean_scheme_cost_per_year, na.rm = TRUE),
+    mean_total_cost_per_year_ni = sum(mean_total_cost_per_year, na.rm = TRUE),
+    mean_ambulance_time = weighted.mean(avg_ambulance_time, w = n_arrests, na.rm = TRUE),
+    mean_ambulance_plus_FR_time = weighted.mean(avg_ambulance_plus_FR_time, w = n_arrests, na.rm = TRUE),
+    icer_from_means = sum(mean_total_cost_per_year, na.rm = TRUE) /
+      sum(mean_qalys_gained_per_year, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(icer_from_means)
+
+results_all_rules_summary_20
+
+# Save the table to a .tex file
+tbl_rules %>%
+  kbl(
+    format    = "latex",
+    booktabs  = TRUE,
+    escape    = FALSE,
+    caption   = "Comparison of FR allocation rules across Northern Ireland under 20 screening simulations per rule. QALYs and mean response times are summed and weighted across all 26 LGDs. Rules are sorted by ICER within each allocation scope group.",
+    label     = "tab:allocation_rules"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position", "scale_down"),
+    font_size     = 10
+  ) %>%
+  pack_rows("NI-wide allocation", 1, n_ni_wide,
+            bold = TRUE, latex_gap_space = "0.3em") %>%
+  pack_rows("Within-LGD allocation (31 FRs per LGD)",
+            n_ni_wide + 1, nrow(tbl_rules),
+            bold = TRUE, latex_gap_space = "0.3em") %>%
+  column_spec(1, width = "6.5cm") %>%
+  column_spec(2:4, width = "2.8cm") %>%
+  footnote(
+    general = c(
+      "Results based on 20 simulated years per rule as a screening exercise.",
+      "$^\\\\dagger$ ICERs are indicative only. The per-year scheme cost used here inflates ICERs relative to the correct 5-year block calculation reported in the main results.",
+      "ICER = Incremental Cost-Effectiveness Ratio. QALYs = Quality-Adjusted Life Years."
+    ),
+    general_title  = "",
+    escape         = FALSE,
+    threeparttable = TRUE
+  ) %>%
+  save_kable(file = "allocation_rules_table.tex")
+
+```
+
+17b. Comparison table:
+```{r}
+# Best LGD by response time improvement and proportion saved
+# Using the lambda_within_LGD rule from the 20-sim screening
+
+lgd_screening <- results_all_rules_lgd_20 %>%
+  filter(rule == "lambda_within_LGD") %>%
+  mutate(
+    rt_improvement     = avg_ambulance_time - avg_ambulance_plus_FR_time,
+    rt_improvement_pct = 100 * rt_improvement / avg_ambulance_time,
+    prop_saved         = ifelse(mean_arrests_per_year > 0,
+                                mean_lives_saved_per_year / mean_arrests_per_year,
+                                NA_real_)
+  ) %>%
+  select(lgd_code, lgd_name,
+         mean_arrests_per_year,
+         avg_ambulance_time,
+         avg_ambulance_plus_FR_time,
+         rt_improvement,
+         rt_improvement_pct,
+         mean_lives_saved_per_year,
+         prop_saved,
+         mean_qalys_gained_per_year,
+         icer_from_means) %>%
+  arrange(desc(rt_improvement))
+
+# Top 10 by response time improvement 
+cat("=== Top 10 LGDs by absolute response time improvement ===\n")
+print(lgd_screening %>% arrange(desc(rt_improvement)) %>%
+        select(lgd_name, avg_ambulance_time,
+               avg_ambulance_plus_FR_time,
+               rt_improvement, rt_improvement_pct) %>%
+        head(10), n = 10)
+
+# Top 10 by % response time improvement
+cat("\n=== Top 10 LGDs by percentage response time improvement ===\n")
+print(lgd_screening %>% arrange(desc(rt_improvement_pct)) %>%
+        select(lgd_name, avg_ambulance_time,
+               avg_ambulance_plus_FR_time,
+               rt_improvement, rt_improvement_pct) %>%
+        head(10), n = 10)
+
+# Top 10 by proportion of arrests saved 
+cat("\n=== Top 10 LGDs by proportion of arrests saved ===\n")
+print(lgd_screening %>% arrange(desc(prop_saved)) %>%
+        select(lgd_name, mean_arrests_per_year,
+               mean_lives_saved_per_year,
+               prop_saved, mean_qalys_gained_per_year) %>%
+        head(10), n = 10)
+
+# Full table sorted by prop_saved 
+cat("\n=== All 26 LGDs sorted by proportion saved ===\n")
+print(lgd_screening %>%
+        arrange(desc(prop_saved)) %>%
+        select(lgd_name, avg_ambulance_time, rt_improvement,
+               prop_saved, mean_qalys_gained_per_year),
+      n = 26)
+```
+
+
+17c. Same as above but for only the wthin-LGD rules:
+```{r}
+within_lgd_rules <- c(
+  "lambda_within_LGD",
+  "lambda_90_area_10_within_LGD",
+  "lambda_80_area_20_within_LGD",
+  "lambda_x_area_pow_0.25_within_LGD",
+  "lambda_x_log_area_within_LGD",
+  "random_within_LGD"
+)
+
+results_within_lgd_20 <- bind_rows(lapply(seq_along(within_lgd_rules), function(r) {
+
+  rule_name <- within_lgd_rules[r]
+
+  bind_rows(lapply(seq_along(lgds), function(i) {
+    run_rule_lgd(
+      rule_name = rule_name,
+      target_lgd = lgds[i],
+      df2_use = df2_20,
+      seed = 10000 + 100 * r + i,
+      return_sim_level = FALSE,
+      max_sims = 20
+    ) %>%
+      dplyr::mutate(rule = rule_name)
+  }))
+
+}))
+
+# Summarise across NI
+results_within_lgd_summary_20 <- results_within_lgd_20 %>%
+  dplyr::group_by(rule) %>%
+  dplyr::summarise(
+    total_fr_ni = sum(n_vol, na.rm = TRUE),
+    total_arrests = sum(n_arrests, na.rm = TRUE),
+    mean_arrests_per_year_ni = sum(n_arrests, na.rm = TRUE) / 20,
+    mean_lives_saved_per_year_ni = sum(mean_lives_saved_per_year, na.rm = TRUE),
+    mean_qalys_gained_per_year_ni = sum(mean_qalys_gained_per_year, na.rm = TRUE),
+    mean_survivor_cost_per_year_ni = sum(mean_survivor_cost_per_year, na.rm = TRUE),
+    mean_scheme_cost_per_year_ni = sum(mean_scheme_cost_per_year, na.rm = TRUE),
+    mean_total_cost_per_year_ni = sum(mean_total_cost_per_year, na.rm = TRUE),
+    mean_ambulance_time = weighted.mean(avg_ambulance_time, w = n_arrests, na.rm = TRUE),
+    mean_ambulance_plus_FR_time = weighted.mean(avg_ambulance_plus_FR_time, w = n_arrests, na.rm = TRUE),
+    icer_from_means = sum(mean_total_cost_per_year, na.rm = TRUE) /
+      sum(mean_qalys_gained_per_year, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(icer_from_means)
+
+results_within_lgd_summary_20
+```
+
+17.d Table for report:
+```{r}
+# TABLE 1: NI-wide allocation rules
+
+rule_labels_ni <- c(
+  "lambda_across_NI"       = "Incidence",
+  "lambda_90_area_10"      = "90\\% incidence, 10\\% area",
+  "lambda_80_area_20"      = "80\\% incidence, 20\\% area",
+  "lambda_x_area_pow_0.25" = "Incidence $\\times$ area$^{0.25}$",
+  "lambda_x_log_area"      = "Incidence $\\times$ log(area)",
+  "random_across_NI_true"  = "Random"
+)
+
+tbl_ni_wide <- results_all_rules_summary_20 %>%
+  filter(rule %in% names(rule_labels_ni)) %>%
+  transmute(
+    `Allocation rule`          = dplyr::recode(rule, !!!rule_labels_ni),
+    `Mean QALYs/year`          = round(mean_qalys_gained_per_year_ni, 2),
+    `Mean EMS+FR time (mins)`  = round(mean_ambulance_plus_FR_time, 3),
+    `ICER (£/QALY)$^\\dagger$` = paste0("\\pounds", formatC(
+                                    icer_from_means,
+                                    format = "f", digits = 0,
+                                    big.mark = ","))
+  ) %>%
+  arrange(`ICER (£/QALY)$^\\dagger$`)
+
+tbl_ni_wide %>%
+  kbl(
+    format   = "latex",
+    booktabs = TRUE,
+    escape   = FALSE,
+    caption  = "NI-wide FR allocation rules compared across 20 screening simulations. QALYs and response times are aggregated across all 26 LGDs. Rules are sorted by ICER.",
+    label    = "tab:ni_wide_rules"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position", "scale_down"),
+    font_size     = 10
+  ) %>%
+  column_spec(1, width = "7cm") %>%
+  column_spec(2:4, width = "3cm") %>%
+  footnote(
+    general = c(
+      "Results based on 20 simulated years per rule as a screening exercise.",
+      "$^\\\\dagger$ ICERs are indicative only. The full 5-year scheme cost is applied per simulated year, inflating ICERs relative to the correct 5-year block calculation.",
+      "ICER = Incremental Cost-Effectiveness Ratio. QALYs = Quality-Adjusted Life Years."
+    ),
+    general_title  = "",
+    escape         = FALSE,
+    threeparttable = TRUE
+  ) %>%
+  save_kable(file = "ni_wide_rules_table.tex")
+
+# TABLE 2: Within-LGD allocation rules
+
+rule_labels_lgd <- c(
+  "lambda_within_LGD"                 = "Incidence",
+  "lambda_90_area_10_within_LGD"      = "90\\% incidence, 10\\% area",
+  "lambda_80_area_20_within_LGD"      = "80\\% incidence, 20\\% area",
+  "lambda_x_area_pow_0.25_within_LGD" = "Incidence $\\times$ area$^{0.25}$",
+  "lambda_x_log_area_within_LGD"      = "Incidence $\\times$ log(area)",
+  "random_within_LGD"                 = "Random"
+)
+
+tbl_within_lgd <- results_within_lgd_summary_20 %>%
+  transmute(
+    `Allocation rule`          = dplyr::recode(rule, !!!rule_labels_lgd),
+    `Mean QALYs/year`          = round(mean_qalys_gained_per_year_ni, 2),
+    `Mean EMS+FR time (mins)`  = round(mean_ambulance_plus_FR_time, 3),
+    `ICER (£/QALY)$^\\dagger$` = paste0("\\pounds", formatC(
+                                    icer_from_means,
+                                    format = "f", digits = 0,
+                                    big.mark = ","))
+  ) %>%
+  arrange(`ICER (£/QALY)$^\\dagger$`)
+
+tbl_within_lgd %>%
+  kbl(
+    format   = "latex",
+    booktabs = TRUE,
+    escape   = FALSE,
+    caption  = "Within-LGD FR allocation rules compared across 20 screening simulations, with 31 first responders assigned per LGD. QALYs and response times are aggregated across all 26 LGDs. Rules are sorted by ICER.",
+    label    = "tab:within_lgd_rules"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position", "scale_down"),
+    font_size     = 10
+  ) %>%
+  column_spec(1, width = "7cm") %>%
+  column_spec(2:4, width = "3cm") %>%
+  footnote(
+    general = c(
+      "Results based on 20 simulated years per rule as a screening exercise.",
+      "$^\\\\dagger$ ICERs are indicative only. The full 5-year scheme cost is applied per simulated year, inflating ICERs relative to the correct 5-year block calculation.",
+      "ICER = Incremental Cost-Effectiveness Ratio. QALYs = Quality-Adjusted Life Years."
+    ),
+    general_title  = "",
+    escape         = FALSE,
+    threeparttable = TRUE
+  ) %>%
+  save_kable(file = "within_lgd_rules_table.tex")
+```
+
+
+
+17e. Identifying the best rule:
+```{r}
+
+
+fixed31_rules <- c("lambda_within_LGD", "random_within_LGD")
+
+results_fixed31_lgd_20 <- results_all_rules_lgd_20 %>%
+  filter(rule %in% fixed31_rules)
+
+#Note: Mean of simulation net monetary benefit (NMB) is the same as NMB from mean QALYs gained and cost
+
+lgd_ranking_fixed31 <- results_fixed31_lgd_20 %>%
+  filter(mean_qalys_gained_per_year > 0.001) %>%
+  mutate(
+    icer_from_means = mean_total_cost_per_year / mean_qalys_gained_per_year,
+    nmb_20000 = 20000 * mean_qalys_gained_per_year - mean_total_cost_per_year,
+    nmb_30000 = 30000 * mean_qalys_gained_per_year - mean_total_cost_per_year,
+    nmb_35000 = 35000 * mean_qalys_gained_per_year - mean_total_cost_per_year
+  )
+
+#Ranking
+best_lgd_by_icer <- lgd_ranking_fixed31 %>%
+  arrange(icer_from_means)
+
+best_lgd_by_nmb_20 <- lgd_ranking_fixed31 %>%
+  arrange(desc(nmb_20000))
+
+best_lgd_by_nmb_30 <- lgd_ranking_fixed31 %>%
+  arrange(desc(nmb_30000))
+
+best_lgd_by_nmb_35 <- lgd_ranking_fixed31 %>%
+  arrange(desc(nmb_35000))
+
+best_lgd_by_icer
+best_lgd_by_nmb_20
+best_lgd_by_nmb_30
+best_lgd_by_nmb_35
+```
+
+
+18a. Running the sim for only the best rule (lambda_across_ni) across 1000 simulations across all LGDs:
+```{r warning=FALSE}
+
+df2_500 <- subset_first_sims(df2, 500)
+
+ni_lambda_across_sim <- bind_rows(lapply(seq_along(lgds), function(i) {
+  out <- run_rule_lgd(
+    rule_name = "lambda_across_NI",
+    target_lgd = lgds[i],
+    df2_use = df2,
+    seed = 50000 + i,
+    return_sim_level = TRUE,
+    max_sims = 1000
+  )
+
+  out$sim_level %>%
+    mutate(
+      rule = "lambda_across_NI",
+      lgd_code = lgds[i]
+    )
+}))
+
+#Aggregate to NI level
+ni_lambda_across_yearly <- ni_lambda_across_sim %>%
+  group_by(sim) %>%
+  summarise(
+    sim_lives_saved_year = sum(sim_lives_saved_year, na.rm = TRUE),
+    sim_qalys_year = sum(sim_qalys_year, na.rm = TRUE),
+    sim_survivor_cost_year = sum(sim_survivor_cost_year, na.rm = TRUE),
+    sim_scheme_cost_year = sum(sim_scheme_cost_year, na.rm = TRUE),
+    sim_total_cost_year = sum(sim_total_cost_year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Convert to 5 year block
+ni_lambda_across_5yr <- make_five_year_blocks(
+  ni_lambda_across_yearly,
+  scheme_cost_is_already_5yr = TRUE
+)
+
+ni_lambda_across_5yr
+
+```
+
+18b. CIs and summary for the above run
+```{r}
+# Survival and response time CIs for the 3 focal LGDs
+lambda_within_sim %>%
+  filter(lgd_code %in% c("95PP", "95HH", "95GG")) %>%
+  group_by(lgd_code) %>%
+  summarise(
+    # EMS response time
+    mean_amb      = mean(avg_ambulance_time,         na.rm = TRUE),
+    lo_amb        = quantile(avg_ambulance_time,      0.025, na.rm = TRUE),
+    hi_amb        = quantile(avg_ambulance_time,      0.975, na.rm = TRUE),
+    # EMS + FR response time
+    mean_fr       = mean(avg_ambulance_plus_FR_time,  na.rm = TRUE),
+    lo_fr         = quantile(avg_ambulance_plus_FR_time, 0.025, na.rm = TRUE),
+    hi_fr         = quantile(avg_ambulance_plus_FR_time, 0.975, na.rm = TRUE),
+    # EMS survival
+    mean_surv_ems = mean(sim_surv_base_year,          na.rm = TRUE),
+    lo_surv_ems   = quantile(sim_surv_base_year,      0.025, na.rm = TRUE),
+    hi_surv_ems   = quantile(sim_surv_base_year,      0.975, na.rm = TRUE),
+    # EMS + FR survival
+    mean_surv_fr  = mean(sim_surv_FR_year,            na.rm = TRUE),
+    lo_surv_fr    = quantile(sim_surv_FR_year,        0.025, na.rm = TRUE),
+    hi_surv_fr    = quantile(sim_surv_FR_year,        0.975, na.rm = TRUE),
+    # Lives saved
+    mean_lives    = mean(sim_lives_saved_year,        na.rm = TRUE),
+    lo_lives      = quantile(sim_lives_saved_year,    0.025, na.rm = TRUE),
+    hi_lives      = quantile(sim_lives_saved_year,    0.975, na.rm = TRUE),
+    # QALYs
+    mean_qalys    = mean(sim_qalys_year,              na.rm = TRUE),
+    lo_qalys      = quantile(sim_qalys_year,          0.025, na.rm = TRUE),
+    hi_qalys      = quantile(sim_qalys_year,          0.975, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print(width = Inf)
+
+correct_icer
+
+```
+
+
+19. Running the sim across all NI LGDS with FRs assigned randomly to compare:
+```{r warning=FALSE}
+
+ni_random_sim <- bind_rows(lapply(seq_along(lgds), function(i) {
+  out <- run_rule_lgd(
+    rule_name = "random_across_NI",
+    target_lgd = lgds[i],
+    df2_use = df2,
+    seed = 50000 + i,
+    return_sim_level = TRUE,
+    max_sims = 1000
+  )
+
+  out$sim_level %>%
+    mutate(
+      rule = "random_across_NI",
+      lgd_code = lgds[i]
+    )
+}))
+
+#Aggregate to NI level
+ni_random_yearly <- ni_random_sim %>%
+  group_by(sim) %>%
+  summarise(
+    sim_lives_saved_year = sum(sim_lives_saved_year, na.rm = TRUE),
+    sim_qalys_year = sum(sim_qalys_year, na.rm = TRUE),
+    sim_survivor_cost_year = sum(sim_survivor_cost_year, na.rm = TRUE),
+    sim_scheme_cost_year = sum(sim_scheme_cost_year, na.rm = TRUE),
+    sim_total_cost_year = sum(sim_total_cost_year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Convert to 5 year block
+ni_random_5yr <- make_five_year_blocks(
+  ni_random_yearly,
+  scheme_cost_is_already_5yr = TRUE
+)
+
+ni_random_5yr
+```
+
+*NI CEA figures*
+
+20a. NI CE plane:
+```{r}
+threshold_lines <- tibble(
+  threshold = c("£20,000", "£30,000", "£35,000"),
+  slope = c(20000, 30000, 35000),
+  intercept = 0
+)
+
+ggplot(ni_lambda_across_5yr, aes(x = qalys_5yr, y = total_cost_5yr)) +
+  geom_point(alpha = 0.5, colour = "#3FA9E2", size = 2.5) +
+  geom_abline(
+    data = threshold_lines,
+    aes(slope = slope, intercept = intercept, colour = threshold, linetype = threshold),
+    linewidth = 0.6
+  ) +
+  scale_colour_manual(
+    name = NULL,
+    values = c(
+      "£20,000" = "#D55E00",
+      "£30,000" = "#0072B2",
+      "£35,000" = "#7B3294"
+    )
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "£20,000" = "longdash",
+      "£30,000" = "longdash",
+      "£35,000" = "longdash"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::label_dollar(prefix = "£", big.mark = ",")
+  ) +
+  labs(
+    x = "Incremental QALYs gained over 5 years",
+    y = "Incremental total cost over 5 years (£)",
+    title = "Cost-effectiveness plane: NI FRs assigned weighted by expected SCAs"
+  ) +
+  guides(
+    colour = guide_legend(nrow = 1),
+    linetype = "none"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+20b. NI CEAC:
+```{r}
+wtp_grid <- seq(0, 50000, by = 1000)
+
+ni_lambda_ceac <- tibble(
+  wtp = wtp_grid,
+  prob_cost_effective = sapply(wtp_grid, function(k) {
+    mean((k * ni_lambda_across_5yr$qalys_5yr -
+            ni_lambda_across_5yr$total_cost_5yr) > 0,
+         na.rm = TRUE)
+  })
+)
+
+ni_random_ceac <- tibble(
+  wtp = wtp_grid,
+  prob_cost_effective = sapply(wtp_grid, function(k) {
+    mean((k * ni_random_5yr$qalys_5yr -
+            ni_random_5yr$total_cost_5yr) > 0,
+         na.rm = TRUE)
+  })
+)
+
+
+# Combine the two CEAC datasets
+ceac_plot <- bind_rows(
+  ni_random_ceac %>%
+    mutate(series = "Base case"),
+  ni_lambda_ceac %>%
+    mutate(series = "Scenario 2")
+)
+
+# Colours
+col_before <- "green"
+col_after  <- "purple"
+
+# Force threshold legend order
+band_levels <- c(
+  "New NICE willingness-to-pay threshold",
+  "Old NICE willingness-to-pay threshold"
+)
+
+# Threshold regions:
+# 20k–25k  = NICE up to Apr 2026 only
+# 25k–30k  = overlap, shown as mixed/patterned
+# 30k–35k  = NICE after Apr 2026 only
+region_left <- tibble(
+  xmin = 20000, xmax = 25000,
+  ymin = 0, ymax = 1,
+  band = factor("Old NICE willingness-to-pay threshold", levels = band_levels)
+)
+
+region_mid <- tibble(
+  xmin = 25000, xmax = 30000,
+  ymin = 0, ymax = 1
+)
+
+region_right <- tibble(
+  xmin = 30000, xmax = 35000,
+  ymin = 0, ymax = 1,
+  band = factor("New NICE willingness-to-pay threshold", levels = band_levels)
+)
+
+# Dummy data just to create a clean threshold legend
+threshold_legend <- tibble(
+  xmin = c(0, 0),
+  xmax = c(0, 0),
+  ymin = c(0, 0),
+  ymax = c(0, 0),
+  band = factor(
+    c(
+      "New NICE willingness-to-pay threshold",
+      "Old NICE willingness-to-pay threshold"
+    ),
+    levels = band_levels
+  )
+)
+
+ggplot() +
+  # Left region: old threshold only
+  geom_rect(
+    data = region_left,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = band),
+    inherit.aes = FALSE,
+    alpha = 0.20,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+
+  # Middle overlap region: mixed colours with diagonal stripes
+  ggpattern::geom_rect_pattern(
+    data = region_mid,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = col_before,
+    alpha = 0.20,
+    pattern = "stripe",
+    pattern_angle = 45,
+    pattern_spacing = 0.03,
+    pattern_density = 0.45,
+    pattern_fill = col_after,
+    pattern_colour = col_after,
+    pattern_alpha = 0.20,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+
+  # Right region: new threshold only
+  geom_rect(
+    data = region_right,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = band),
+    inherit.aes = FALSE,
+    alpha = 0.20,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+
+  # Dummy layer for proper threshold legend
+  geom_rect(
+    data = threshold_legend,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = band),
+    inherit.aes = FALSE,
+    alpha = 0.20,
+    colour = NA
+  ) +
+
+  # CEAC lines
+  geom_line(
+    data = ceac_plot,
+    aes(x = wtp, y = prob_cost_effective, colour = series, linetype = series),
+    linewidth = 1.5,
+    alpha = 0.95
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = label_percent(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_x_continuous(
+    labels = label_dollar(prefix = "£", big.mark = ","),
+    breaks = seq(10000, max(ceac_plot$wtp, na.rm = TRUE), by = 5000),
+    expand = expansion(mult = c(0, 0.03))
+  ) +
+  coord_cartesian(xlim = c(10000, NA)) +
+
+  scale_colour_manual(
+    name = "Curve",
+    values = c(
+      "Base case" = "cyan",
+      "Scenario 2" = "#FFD700"
+    ),
+    labels = c(
+      "Base case" = "FRs randomly distributed",
+      "Scenario 2" = "FRs distributed weighted by expected annual SCAs"
+    )
+  ) +
+  scale_linetype_manual(
+    name = "Curve",
+    values = c(
+      "Base case" = "solid",
+      "Scenario 2" = "64"
+    ),
+    labels = c(
+      "Base case" = "FRs randomly distributed",
+      "Scenario 2" = "FRs distributed weighted by expected annual SCAs"
+    )
+  ) +
+  scale_fill_manual(
+    name = "Threshold region",
+    limits = band_levels,
+    values = c(
+      "New NICE willingness-to-pay threshold" = col_after,
+      "Old NICE willingness-to-pay threshold" = col_before
+    )
+  ) +
+
+  labs(
+    x = "Willingness-to-pay threshold (£ per QALY)",
+    y = "Probability cost-effective",
+    colour = "Curve",
+    linetype = "Curve",
+    fill = "Threshold region"
+  ) +
+
+  guides(
+    linetype = "none"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11, colour = "grey30"),
+    axis.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8.5),
+    legend.box.spacing = grid::unit(0.1, "lines"),
+    legend.spacing.y = grid::unit(0.1, "lines"),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.box.margin = margin(0, 0, 0, 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+
+*21. Best LGD-rule case study (Belfast random)*
+
+21a. Rerun the sim with 1000 sims for just this LGD-rule combo:
+```{r}
+
+best_rule <- best_lgd_by_nmb_35$rule[[1]]
+best_lgd  <- best_lgd_by_nmb_35$lgd_code[[1]]
+best_lgd_name <- best_lgd_by_nmb_35$lgd_name[[1]]
+
+best_lgd_ce <- run_rule_lgd(
+  rule_name = best_rule,
+  target_lgd = best_lgd,
+  df2_use = df2,
+  seed = 4001,
+  return_sim_level = TRUE,
+  max_sims = 1000
+)
+
+best_lgd_ce$summary
+head(best_lgd_ce$sim_level)
+
+#Convert to 5 year block
+best_lgd_5yr <- make_five_year_blocks(
+  best_lgd_ce$sim_level,
+  scheme_cost_is_already_5yr = TRUE
+)
+
+best_lgd_5yr
+
+```
+21b. Rerun 1000 sims for Belfast assigned by lambda:
+```{r}
+best_rule_2 <- best_lgd_by_nmb_35$rule[[1]]
+best_lgd_2  <- best_lgd_by_nmb_35$lgd_code[[1]]
+best_lgd_name_2 <- best_lgd_by_nmb_35$lgd_name[[1]]
+
+best_lgd_2_ce <- run_rule_lgd(
+  rule_name = best_rule_2,
+  target_lgd = best_lgd_2,
+  df2_use = df2,
+  seed = 4001,
+  return_sim_level = TRUE,
+  max_sims = 1000
+)
+
+best_lgd_2_ce$summary
+head(best_lgd_2_ce$sim_level)
+
+#Convert to 5 year block
+best_lgd_5yr_2 <- make_five_year_blocks(
+  best_lgd_2_ce$sim_level,
+  scheme_cost_is_already_5yr = TRUE
+)
+
+best_lgd_5yr_2
+```
+
+*CEA*
+
+21c. CE Plane:
+```{r}
+threshold_lines <- tibble(
+  threshold = c("£20,000", "£30,000", "£35,000"),
+  slope = c(20000, 30000, 35000),
+  intercept = 0
+)
+
+ggplot(best_lgd_5yr, aes(x = qalys_5yr, y = total_cost_5yr)) +
+  geom_point(alpha = 0.5, colour = "#3FA9E2", size = 2.5) +
+  geom_abline(
+    data = threshold_lines,
+    aes(slope = slope, intercept = intercept, colour = threshold, linetype = threshold),
+    linewidth = 0.6
+  ) +
+  scale_colour_manual(
+    name = NULL,
+    values = c(
+      "£20,000" = "#D55E00",
+      "£30,000" = "#0072B2",
+      "£35,000" = "#7B3294"
+    )
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "£20,000" = "longdash",
+      "£30,000" = "longdash",
+      "£35,000" = "longdash"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::label_dollar(prefix = "£", big.mark = ",")
+  ) +
+  labs(
+    x = "Incremental QALYs gained over 5 years",
+    y = "Incremental total cost over 5 years (£)",
+    title = "Cost-effectiveness plane: Belfast FRs randomly assigned"
+  ) +
+  guides(
+    colour = guide_legend(nrow = 1),
+    linetype = "none"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+21d. CEAC:
+```{r}
+best_lgd_ceac <- tibble(
+  wtp = wtp_grid,
+  prob_cost_effective = sapply(wtp_grid, function(k) {
+    mean((k * best_lgd_5yr$qalys_5yr -
+            best_lgd_5yr$total_cost_5yr) > 0,
+         na.rm = TRUE)
+  })
+)
+
+best_lgd_2_ceac <- tibble(
+  wtp = wtp_grid,
+  prob_cost_effective = sapply(wtp_grid, function(k) {
+    mean((k * best_lgd_5yr_2$qalys_5yr -
+            best_lgd_5yr_2$total_cost_5yr) > 0,
+         na.rm = TRUE)
+  })
+)
+
+# Combine the two CEAC datasets
+ceac_plot <- bind_rows(
+  best_lgd_ceac %>%
+    mutate(series = "Base case"),
+  best_lgd_2_ceac %>%
+    mutate(series = "Scenario 2")
+)
+
+# Colours
+col_before <- "green"
+col_after  <- "purple"
+
+# Force threshold legend order
+band_levels <- c(
+  "New NICE willingness-to-pay threshold",
+  "Old NICE willingness-to-pay threshold"
+)
+
+# Threshold regions:
+# 20k–25k  = NICE up to Apr 2026 only
+# 25k–30k  = overlap, shown as mixed/patterned
+# 30k–35k  = NICE after Apr 2026 only
+region_left <- tibble(
+  xmin = 20000, xmax = 25000,
+  ymin = 0, ymax = 1,
+  band = factor("Old NICE willingness-to-pay threshold", levels = band_levels)
+)
+
+region_mid <- tibble(
+  xmin = 25000, xmax = 30000,
+  ymin = 0, ymax = 1
+)
+
+region_right <- tibble(
+  xmin = 30000, xmax = 35000,
+  ymin = 0, ymax = 1,
+  band = factor("New NICE willingness-to-pay threshold", levels = band_levels)
+)
+
+# Dummy data just to create a clean threshold legend
+threshold_legend <- tibble(
+  xmin = c(0, 0),
+  xmax = c(0, 0),
+  ymin = c(0, 0),
+  ymax = c(0, 0),
+  band = factor(
+    c(
+      "New NICE willingness-to-pay threshold",
+      "Old NICE willingness-to-pay threshold"
+    ),
+    levels = band_levels
+  )
+)
+
+ggplot() +
+  # Left region: old threshold only
+  geom_rect(
+    data = region_left,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = band),
+    inherit.aes = FALSE,
+    alpha = 0.20,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+
+  # Middle overlap region: mixed colours with diagonal stripes
+  ggpattern::geom_rect_pattern(
+    data = region_mid,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = col_before,
+    alpha = 0.20,
+    pattern = "stripe",
+    pattern_angle = 45,
+    pattern_spacing = 0.03,
+    pattern_density = 0.45,
+    pattern_fill = col_after,
+    pattern_colour = col_after,
+    pattern_alpha = 0.20,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+
+  # Right region: new threshold only
+  geom_rect(
+    data = region_right,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = band),
+    inherit.aes = FALSE,
+    alpha = 0.20,
+    colour = NA,
+    show.legend = FALSE
+  ) +
+
+  # Dummy layer for proper threshold legend
+  geom_rect(
+    data = threshold_legend,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = band),
+    inherit.aes = FALSE,
+    alpha = 0.20,
+    colour = NA
+  ) +
+
+  # CEAC lines
+  geom_line(
+    data = ceac_plot,
+    aes(x = wtp, y = prob_cost_effective, colour = series, linetype = series),
+    linewidth = 1.5,
+    alpha = 0.95
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = label_percent(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_x_continuous(
+    labels = label_dollar(prefix = "£", big.mark = ","),
+    breaks = seq(10000, max(ceac_plot$wtp, na.rm = TRUE), by = 5000),
+    expand = expansion(mult = c(0, 0.03))
+  ) +
+  coord_cartesian(xlim = c(10000, NA)) +
+
+  scale_colour_manual(
+    name = "Curve",
+    values = c(
+      "Base case" = "cyan",
+      "Scenario 2" = "#FFD700"
+    ),
+    labels = c(
+      "Base case" = "FRs randomly distributed",
+      "Scenario 2" = "FRs distributed weighted by expected annual SCAs"
+    )
+  ) +
+  scale_linetype_manual(
+    name = "Curve",
+    values = c(
+      "Base case" = "solid",
+      "Scenario 2" = "64"
+    ),
+    labels = c(
+      "Base case" = "FRs randomly distributed",
+      "Scenario 2" = "FRs distributed weighted by expected annual SCAs"
+    )
+  ) +
+  scale_fill_manual(
+    name = "Threshold region",
+    limits = band_levels,
+    values = c(
+      "New NICE willingness-to-pay threshold" = col_after,
+      "Old NICE willingness-to-pay threshold" = col_before
+    )
+  ) +
+
+  labs(
+    x = "Willingness-to-pay threshold (£ per QALY)",
+    y = "Probability cost-effective",
+    colour = "Curve",
+    linetype = "Curve",
+    fill = "Threshold region"
+  ) +
+
+  guides(
+    linetype = "none"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11, colour = "grey30"),
+    axis.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8.5),
+    legend.box.spacing = grid::unit(0.1, "lines"),
+    legend.spacing.y = grid::unit(0.1, "lines"),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.box.margin = margin(0, 0, 0, 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+22a. Running across all LGDs lambda within LGD (31 FRs each, 1000 sims):
+```{r}
+lgds <- sort(unique(zone_count$lgd))
+
+lambda_within_sim <- bind_rows(lapply(seq_along(lgds), function(i) {
+  run_rule_lgd(
+    rule_name = "lambda_within_LGD",
+    target_lgd = lgds[i],
+    df2_use = df2,   
+    seed = 5000 + i,
+    return_sim_level = TRUE,
+    max_sims = 1000
+  )$sim_level %>%
+    mutate(
+      rule = "lambda_within_LGD",
+      lgd_code = lgds[i]
+    )
+}))
+```
+
+
+
+
+22b. 3D plot of Geography, Population and QALYs/Lives saved for lambda-within NI:
+```{r}
+#LGD level summary of lambda across NI
+lambda_within_summ <- lambda_within_sim %>%
+  group_by(lgd_code, lgd_name) %>%
+  summarise(
+    mean_lives_saved_per_year = mean(sim_lives_saved_year, na.rm = TRUE),
+    mean_qalys_gained_per_year = mean(sim_qalys_year, na.rm = TRUE),
+    mean_survivor_cost_per_year = mean(sim_survivor_cost_year, na.rm = TRUE),
+    mean_scheme_cost_per_year = mean(sim_scheme_cost_year, na.rm = TRUE),
+    mean_total_cost_per_year = mean(sim_total_cost_year, na.rm = TRUE),
+    mean_icer = mean(sim_icer, na.rm = TRUE),
+    icer_from_means = mean(sim_total_cost_year, na.rm = TRUE) /
+      mean(sim_qalys_year, na.rm = TRUE),
+    mean_arrests_per_year = mean(n_arrests, na.rm = TRUE),
+    mean_ambulance_time = mean(avg_ambulance_time, na.rm = TRUE),
+    mean_ambulance_plus_FR_time = mean(avg_ambulance_plus_FR_time, na.rm = TRUE),
+    n_vol = mean(n_vol, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Build LGD info again
+lgd_meta <- zone_count %>%
+  st_drop_geometry() %>%
+  group_by(lgd, lgd_name) %>%
+  summarise(
+    lgd_population = sum(count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+lgd_area <- NI_shapefile %>%
+  st_make_valid() %>%
+  left_join(
+    zone_values %>%
+      select(zone_code, lgd, lgd_name) %>%
+      distinct(),
+    by = "zone_code"
+  ) %>%
+  filter(!is.na(lgd)) %>%
+  group_by(lgd, lgd_name) %>%
+  summarise(.groups = "drop") %>%
+  mutate(
+    lgd_area_km2 = as.numeric(st_area(geometry)) / 1e6
+  ) %>%
+  st_drop_geometry() %>%
+  select(lgd, lgd_name, lgd_area_km2)
+
+lgd_meta <- lgd_meta %>%
+  left_join(lgd_area, by = c("lgd", "lgd_name"))
+
+lgd_meta
+
+#Getting FR count for the lambda rule again (just double checking)
+
+rule_to_plot <- "lambda_within_lgd"
+
+fr_lgd <- fr_alloc_all_rules %>%
+  filter(rule == rule_to_plot) %>%
+   group_by(rule, lgd, lgd_name) %>%
+  summarise(
+    total_fr_lgd = sum(fr_target, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Build LGD master plotting table
+plot_lgd_master <- lambda_within_summ %>%
+  left_join(
+    lgd_meta,
+    by = c("lgd_code" = "lgd", "lgd_name")
+  ) %>%
+  left_join(
+    fr_lgd,
+    by = c("lgd_code" = "lgd", "lgd_name")
+  )
+
+#3d plot
+library(plotly)
+
+plot_ly(
+  data = plot_lgd_master,
+  x = ~lgd_population,
+  y = ~lgd_area_km2,
+  z = ~mean_qalys_gained_per_year,
+  type = "scatter3d",
+  mode = "markers+text",
+  text = ~lgd_name,
+  hovertemplate = paste(
+    "<b>%{text}</b><br>",
+    "Population: %{x}<br>",
+    "Area (km²): %{y:.1f}<br>",
+    "Mean QALYs/year: %{z:.2f}<extra></extra>"
+  ),
+  marker = list(size = 5)
+) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Population"),
+      yaxis = list(title = "Area (km²)"),
+      zaxis = list(title = "Mean QALYs gained per year")
+    ),
+    title = "Population, area, and QALYs gained by LGD under lambda_across_NI"
+  )
+```
+
+2d plot, area vs QALYs + pop vs QALYs:
+```{r}
+
+ggplot(plot_lgd_master, aes(x = lgd_population, y = mean_qalys_gained_per_year, label = lgd_name)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.4, size = 3) +
+  labs(
+    x = "LGD population",
+    y = "Mean QALYs gained per year",
+    title = "Population and QALYs gained by LGD"
+  ) +
+  theme_minimal()
+
+#Area vs QALYs
+
+ggplot(plot_lgd_master, aes(x = lgd_area_km2, y = mean_qalys_gained_per_year, label = lgd_name)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.4, size = 3) +
+  labs(
+    x = "LGD area (km²)",
+    y = "Mean QALYs gained per year",
+    title = "Area and QALYs gained by LGD"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+# FR distribution under NI-wide incidence rule
+fr_alloc_all_rules %>%
+  filter(rule == "lambda_across_NI") %>%
+  group_by(lgd, lgd_name) %>%
+  summarise(total_fr = sum(fr_target, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_fr)) %>%
+  print(n = 26)
+```
+
+Maps:
+```{r}
+lgd_sf <- NI_shapefile %>%
+  st_make_valid() %>%
+  left_join(
+    zone_values %>%
+      select(zone_code, lgd, lgd_name) %>%
+      distinct(),
+    by = "zone_code"
+  ) %>%
+  filter(!is.na(lgd)) %>%
+  group_by(lgd, lgd_name) %>%
+  summarise(.groups = "drop") %>%
+  st_make_valid()
+
+#LGD level summary of lambda across NI
+ni_lambda_lgd <- ni_lambda_across_sim %>%
+  group_by(lgd_code, lgd_name) %>%
+  summarise(
+    mean_lives_saved_per_year = mean(sim_lives_saved_year, na.rm = TRUE),
+    mean_qalys_gained_per_year = mean(sim_qalys_year, na.rm = TRUE),
+    mean_survivor_cost_per_year = mean(sim_survivor_cost_year, na.rm = TRUE),
+    mean_scheme_cost_per_year = mean(sim_scheme_cost_year, na.rm = TRUE),
+    mean_total_cost_per_year = mean(sim_total_cost_year, na.rm = TRUE),
+    mean_icer = mean(sim_icer, na.rm = TRUE),
+    icer_from_means = mean(sim_total_cost_year, na.rm = TRUE) /
+      mean(sim_qalys_year, na.rm = TRUE),
+    mean_arrests_per_year = mean(n_arrests, na.rm = TRUE),
+    mean_ambulance_time = mean(avg_ambulance_time, na.rm = TRUE),
+    mean_ambulance_plus_FR_time = mean(avg_ambulance_plus_FR_time, na.rm = TRUE),
+    n_vol = mean(n_vol, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+#Getting FR count for the lambda rule again
+
+rule_to_plot <- "lambda_across_NI"
+
+fr_lgd <- fr_alloc_all_rules %>%
+  filter(rule == rule_to_plot) %>%
+   group_by(rule, lgd, lgd_name) %>%
+  summarise(
+    total_fr_lgd = sum(fr_target, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Build LGD master plotting table
+plot_lgd_master_maps <- ni_lambda_lgd %>%
+  left_join(
+    lgd_meta,
+    by = c("lgd_code" = "lgd", "lgd_name")
+  ) %>%
+  left_join(
+    fr_lgd,
+    by = c("lgd_code" = "lgd", "lgd_name")
+  )
+
+map1_sf <- lgd_sf %>%
+  left_join(
+    plot_lgd_master_maps %>% select(lgd_code, lgd_name, total_fr_lgd),
+    by = c("lgd" = "lgd_code", "lgd_name")
+  )
+
+ggplot(map1_sf) +
+  geom_sf(aes(fill = total_fr_lgd), colour = "white", linewidth = 0.2) +
+  scale_fill_viridis_c(name = "FRs") +
+  labs(
+    title = "Number of first responders by LGD"
+  ) +
+  theme_minimal()
+
+map2_sf <- lgd_sf %>%
+  left_join(
+    plot_lgd_master %>% select(lgd_code, lgd_name, mean_qalys_gained_per_year),
+    by = c("lgd" = "lgd_code", "lgd_name")
+  )
+
+ggplot(map2_sf) +
+  geom_sf(aes(fill = mean_qalys_gained_per_year), colour = "white", linewidth = 0.2) +
+  scale_fill_viridis_c(name = "Mean QALYs/year") +
+  labs(
+    title = "Mean QALYs gained per year by LGD",
+    subtitle = "Rule: Random across NI"
+  ) +
+  theme_minimal()
+
+
+
+map3_sf <- lgd_sf %>%
+  left_join(
+    plot_lgd_master %>% select(lgd_code, lgd_name, icer_from_means),
+    by = c("lgd" = "lgd_code", "lgd_name")
+  )
+
+ggplot(map3_sf) +
+  geom_sf(aes(fill = pmin(icer_from_means, 50000)), colour = "white", linewidth = 0.2) +
+  scale_fill_viridis_c(
+    name = "ICER (£/QALY)",
+    labels = scales::label_dollar(prefix = "£", big.mark = ","),
+    na.value = "grey80"
+  ) +
+  labs(
+    title = "Cost-effectiveness by LGD",
+    subtitle = "Rule: Random across NI (capped at £50,000/QALY)"
+  ) +
+  theme_minimal()
+```

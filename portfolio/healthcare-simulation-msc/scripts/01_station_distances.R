@@ -1,0 +1,255 @@
+# 01_station_distances.R
+#
+# Geocodes the NIAS ambulance station list, finds the nearest and second-nearest station to
+# each 2021 Data Zone centroid (k-nearest-neighbours on Irish Grid coordinates), and converts
+# the distances to the log-miles covariates used by the ambulance response-time model. Needs
+# internet (geocoding). The result is saved so this step only has to run once.
+#
+# Needs : config.R, the Data Zone shapefile (paths$shapefile)
+# Makes : data/processed/coa_nearest_ambulance.csv
+
+if (!exists("paths")) source("config.R")
+for (p in c("tidyverse", "tidygeocoder", "sf", "RANN", "units"))
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+library(tidyverse)
+library(tidygeocoder)
+library(sf)
+library(RANN)    # fast k-nearest-neighbours
+library(units)
+
+
+# ---- 1. Station list (names from a Freedom of Information reply) ---------------------------
+# 1) Paste the official short names into a vector (from the FOI reply)
+stations <- tibble(
+  name_short = c(
+    "ALTNAGELVIN","ANTRIM","ARDOYNE","ARMAGH","BALLYCASTLE","BALLYMENA","BALLYMONEY",
+    "BALLYNAHINCH","BANBRIDGE","BANGOR","BRIDGE","BROADWAY","CARRICK","CASTLEDERG",
+    "COLERAINE","COMBER","COOKSTOWN","CRAIGAVON","DERRIAGHY","DOWNPATRICK","DUNGANNON",
+    "ENNISKILLEN","K'BRACKEN","KILKEEL","LARNE","LIMAVADY","LISBURN","MAGHERFELT",
+    "N'ARDS","NEWCASTLE","NEWRY","OMAGH","STRABANE","AMB HEADQUARTERS","WHITEABBEY"
+    # add more if FOI list had additional entries (or expand abbreviations)
+  )
+)
+
+# ---- 2. Expand short names into addresses that geocode reliably ----------------------------
+# 2) Expand short names into an address string that'll geocode reliably.
+stations <- stations %>%
+  mutate(
+    preferred_address = case_when(
+      name_short == "K'BRACKEN" ~ "Knockbracken Healthcare Park, Saintfield Road, Belfast, Northern Ireland",
+      name_short %in% c("BROADWAY","BROADWAY") ~ "Broadway Ambulance Station, Belfast, Northern Ireland",
+      name_short == "N'ARDS" ~ "Newtownards, County Down, Northern Ireland",
+      name_short == "AMB HEADQUARTERS" ~ "Northern Ireland Ambulance Service Headquarters, Knockbracken Healthcare Park, Belfast, Northern Ireland",
+      TRUE ~ paste0(name_short, ", Northern Ireland")
+    )
+  )
+
+# ---- 3. Geocode ----------------------------------------------------------------------------
+# 3) Geocode the station names (OpenStreetMap Nominatim via tidygeocoder). Needs internet.
+
+stations_geo <- stations %>%
+  geocode(
+    address = preferred_address,
+    method = "osm",
+    lat = "lat",
+    long = "lon",
+    limit = 1
+  )
+
+# ---- 4. Inspect failures and add manual coordinates ----------------------------------------
+#Inspect
+stations_geo %>% select(name_short, preferred_address, lat, lon)
+
+failed <- stations_geo %>%
+  filter(is.na(lat) | is.na(lon)) %>%
+  select(name_short, preferred_address)
+
+manual_coords <- tibble::tribble(
+  ~name_short,   ~lat,      ~lon,
+  "BROADWAY",      54.59100805461331, -5.958371987379141,
+  "MAGHERFELT",   54.7621348832326, -6.6155338248346816,
+  "AMB HEADQUARTERS",  54.67150405860009, -5.910028940771601,
+  "CARRICK", 54.72114485283946, -5.801439160053325
+  
+)
+
+stations_final <- stations_geo %>%
+  left_join(manual_coords, by = "name_short", suffix = c("", "_manual")) %>%
+  mutate(
+    lat = dplyr::coalesce(lat_manual, lat),   # use manual if present, else original
+    lon = dplyr::coalesce(lon_manual, lon)
+  ) %>%
+  select(-lat_manual, -lon_manual)
+
+stations_sf <- st_as_sf(
+  stations_final,
+  coords = c("lon","lat"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# ---- 5. Data Zone centroids and projected coordinates (EPSG:29902, metres) -----------------
+coa <- st_read(paths$shapefile)
+# If polygons are tiny or centroids fall outside polygons, consider
+# coa_pts <- st_point_on_surface(coa)
+coa_pts <- st_centroid(coa)   # centroids
+# check CRS
+st_crs(stations_sf)
+st_crs(coa_pts)
+
+
+# if points are lon/lat but missing CRS, set it (DO NOT use st_set_crs if coords are actually projected)
+stations_sf <- st_set_crs(stations_sf, 4326)   # only if your lon/lat are WGS84
+
+# transform both layers to projected CRS (example: EPSG:29902)
+stations_proj <- st_transform(stations_sf, 29902)
+coa_proj      <- st_transform(coa_pts,    29902)
+
+# now get eastings/northings
+coords <- st_coordinates(stations_proj)    # matrix with X = easting, Y = northing
+head(coords)
+
+# distances will now be in metres
+d <- st_distance(coa_proj, stations_proj)
+units(d)  # should show "m" (metres)
+
+# ---- 6. k-nearest-neighbour search: nearest and second-nearest station ---------------------
+# - stations_sf : sf POINTs for ambulance stations (can be lon/lat or projected)
+# - coa_pts     : sf POINTs for COA centroids (can be lon/lat or projected)
+#
+
+
+if (!exists("stations_sf") || !exists("coa_pts")) {
+  stop("This script expects two sf objects in your workspace: `stations_sf` and `coa_pts`.")
+}
+
+# ---- 1) Check CRS ----
+# If CRS missing, stop and ask to set it (safer than guessing)
+if (is.na(st_crs(stations_sf))) stop("stations_sf has no CRS. If coords are lon/lat set with st_set_crs(stations_sf, 4326).")
+if (is.na(st_crs(coa_pts))) stop("coa_pts has no CRS. If coords are lon/lat set with st_set_crs(coa_pts, 4326).")
+
+# Choose target projected CRS for distance (metres).
+# Common for NI: EPSG:29902 (TM65 Irish Grid). Change if you prefer 2157.
+target_crs <- 29902
+
+stations_proj <- st_transform(stations_sf, target_crs)
+coa_proj      <- st_transform(coa_pts, target_crs)
+
+# ---- 2) Prepare ID columns (detect or create) ----
+# Station ID detection (fall back to row number)
+possible_station_ids <- c("name_short", "name", "station_id", "id")
+station_id_col <- intersect(possible_station_ids, names(stations_proj)) %>% first()
+if (is.na(station_id_col)) {
+  stations_proj$station_id <- paste0("stn_", seq_len(nrow(stations_proj)))
+  station_id_col <- "station_id"
+}
+
+# COA ID detection (fall back to row number)
+possible_coa_ids <- c("DZ2021_cd", "coa_id", "id", "code", "oa11", "objectid")
+coa_id_col <- intersect(possible_coa_ids, names(coa_proj)) %>% first()
+if (is.na(coa_id_col)) {
+  coa_proj$coa_id <- paste0("coa_", seq_len(nrow(coa_proj)))
+  coa_id_col <- "coa_id"
+}
+
+# ---- 3) Build coordinate matrices for k-NN ----
+# st_coordinates returns matrix: X (easting), Y (northing)
+coa_coords    <- st_coordinates(coa_proj)
+station_coords<- st_coordinates(stations_proj)
+
+# RANN requires numeric matrices (rows = observations)
+# If there is only 1 station, handle gracefully
+n_stations <- nrow(station_coords)
+k <- min(2, n_stations)  # want up to 2 neighbors
+
+# ---- 4) run RANN k-NN (fast) ----
+nn_res <- RANN::nn2(
+  data = station_coords,
+  query = coa_coords,
+  k = k,
+  searchtype = "standard"
+)
+
+# nn_res$nn.idx is n_coa x k (indices into stations)
+# nn_res$nn.dists is distances in the same units as coords (metres because we projected)
+
+# ---- 5) build output table ----
+# helper vectors
+station_ids <- stations_proj[[station_id_col]]
+
+# function to pull station info by index vector
+get_station_field <- function(idx_vec, field = station_ids, coords_mat = station_coords, which = 1) {
+  # idx_vec: vector of indices for each coa; field: vector of station ids
+  sapply(seq_len(nrow(coa_proj)), function(i) {
+    if (is.na(idx_vec[i])) return(NA_character_)
+    field[idx_vec[i]]
+  }, USE.NAMES = FALSE)
+}
+
+# produce columns
+idx_mat  <- nn_res$nn.idx
+dist_mat <- nn_res$nn.dists
+
+# ensure idx_mat has 2 columns even if k==1 (to simplify code)
+if (k == 1) {
+  idx_mat <- cbind(idx_mat, NA_integer_)
+  dist_mat <- cbind(dist_mat, NA_real_)
+}
+
+coa_nearest_ambulance <- tibble(
+  DZ2021_cd = coa_proj$DZ2021_cd,             
+  LGD2014_nm = coa_proj$LGD2014_nm,            
+  # or LGD2014_cd if you prefer codes
+
+  coa_easting = coa_coords[,1],
+  coa_northing = coa_coords[,2],
+
+  nearest1_station_id = station_ids[idx_mat[,1]],
+  nearest1_station_easting = ifelse(!is.na(idx_mat[,1]), station_coords[idx_mat[,1],1], NA_real_),
+  nearest1_station_northing = ifelse(!is.na(idx_mat[,1]), station_coords[idx_mat[,1],2], NA_real_),
+  nearest1_dist_m = dist_mat[,1],
+
+  nearest2_station_id = ifelse(!is.na(idx_mat[,2]), station_ids[idx_mat[,2]], NA_character_),
+  nearest2_station_easting = ifelse(!is.na(idx_mat[,2]), station_coords[idx_mat[,2],1], NA_real_),
+  nearest2_station_northing = ifelse(!is.na(idx_mat[,2]), station_coords[idx_mat[,2],2], NA_real_),
+  nearest2_dist_m = ifelse(!is.na(dist_mat[,2]), dist_mat[,2], NA_real_)
+)
+
+
+# Add original geometry if you want to keep it in output sf later. Here we keep plain table for CSV.
+# (the CSV is written at the end of this script, after the mile conversions)
+
+# ---- 7. Distances in miles, ln(miles + 1) --------------------------------------------------
+coa_nearest_ambulance <- coa_nearest_ambulance %>%
+  mutate(
+    nearest1_miles = nearest1_dist_m / 1609.344,
+    nearest2_miles = nearest2_dist_m / 1609.344,
+
+    ln_nearest1_miles = ifelse(nearest1_miles > 0, log(nearest1_miles + 1), NA_real_),
+    ln_nearest2_miles = ifelse(nearest2_miles > 0, log(nearest2_miles + 1), NA_real_)
+  )
+
+# ---- 8. Indicator for nearest station within 2 miles, final table --------------------------
+coa_nearest_ambulance <- coa_nearest_ambulance %>%
+  mutate(
+    near_2mi = ifelse(nearest1_miles < 2, 1L, 0L)
+  )
+
+
+coa_nearest_ambulance <- coa_nearest_ambulance %>%
+  transmute(
+    DZ2021_cd,
+    ln_nearest1_miles,
+    ln_nearest2_miles,
+    near_2mi,
+    LGD2014_nm,
+    coa_easting,
+    coa_northing
+  )
+
+coa_nearest_ambulance <- coa_nearest_ambulance %>%
+  rename(zone_code = DZ2021_cd)
+# ---- 9. Save ----------------------------------------------------------------------------
+dir.create(dirname(paths$coa_distances), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(coa_nearest_ambulance, paths$coa_distances)
+message("Wrote ", paths$coa_distances, " (", nrow(coa_nearest_ambulance), " Data Zones).")

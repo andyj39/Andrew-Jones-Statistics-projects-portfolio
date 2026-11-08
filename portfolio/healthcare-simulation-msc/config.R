@@ -11,7 +11,7 @@ paths <- list(
 )
 
 # Number of simulated years per data zone. The dissertation results use 1000.
-# For a quick smoke test use e.g.  N_SIM_YEARS=20 Rscript run_all.R
+# For a quick test use N_SIM_YEARS=20 Rscript run_all.R
 n_sim_years <- as.integer(Sys.getenv("N_SIM_YEARS", "1000"))
 
 check_inputs <- function(include_coa = TRUE) {

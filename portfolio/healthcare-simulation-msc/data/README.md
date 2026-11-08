@@ -1,6 +1,6 @@
 # Data
 
-The input files are not stored in this repository. The scripts expect these five files in `data/raw/`. The file names are set in `config.R`.
+The input files are not stored in this repository as github limits the size of files allowed in repositories. The scripts expect these five files in `data/raw/`. The file names are set in `config.R`.
 
 | File | What it holds | Source |
 |---|---|---|

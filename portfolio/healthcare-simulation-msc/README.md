@@ -2,9 +2,9 @@
 
 Master's project (MSci, Queen's University Belfast, 2026), supervised by Dr Karen Cairns. A Monte Carlo simulation in R. The dissertation also includes a separate discrete-event simulation of ambulance handover queues (R, simmer), with its script in [`des/`](des). The full dissertation is in [`report/`](report/MSci_dissertation_Andrew_Jones.pdf).
 
-**Question:** would a scheme of volunteer first responders, paged to cardiac arrests and carrying defibrillators, be good value for the NHS in Northern Ireland, and where and how should the volunteers be placed?
+**Question:** would a scheme of volunteer first responders paged to cardiac arrests and carrying defibrillators be good value for the NHS in Northern Ireland according to National Institute for Health and Care Excellence (NICE) guidelines, and where and how should the volunteers be placed?
 
-**Short answer, as the model has it:** in Belfast the scheme costs about £26,500 per quality-adjusted life year (QALY), and about 70% of simulated five-year periods come in under NICE's £30,000 limit. In rural Fermanagh it costs about £161,800 per QALY, far above any threshold.
+**Short answer from the model** in Belfast the scheme costs about £26,500 per quality-adjusted life year (QALY), and about 70% of simulated five-year periods come in under NICE's £30,000 limit. In rural Fermanagh it costs about £161,800 per QALY, far above any threshold.
 
 ## Background
 

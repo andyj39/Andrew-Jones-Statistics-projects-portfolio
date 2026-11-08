@@ -55,7 +55,7 @@ A country can be in several balls, because balls are allowed to overlap. The bal
 
 ## Data
 
-The data files are not in this repository. The COVID-19 file is about 150 MB, and both datasets have their own terms of use. Download them and put them in `data/` with these names:
+The data files are not in this repository as they are too large. Download them and put them in `data/` with these names:
 
 | File in `data/` | Source |
 |---|---|

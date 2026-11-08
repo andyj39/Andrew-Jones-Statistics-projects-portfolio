@@ -6,7 +6,7 @@ Group project for MTH4322 at Queen's University Belfast (December 2025), done wi
 
 ## What Ball Mapper does
 
-Each country is a point in five-dimensional space, with one coordinate for each variable (after scaling every variable to run from 0 to 1). Countries that are close together in this space have similar population density, age, wealth, hospital capacity and travel restrictions.
+Each country is a point in five-dimensional space, with one coordinate for each variable (after standardising every variable to run from 0 to 1). Countries that are close together in this space have similar population density, age, wealth, hospital capacity and travel restrictions.
 
 **How a ball is formed**
 

@@ -171,8 +171,7 @@ The quick run gives rough numbers, so use it for checking only. It needs the NHS
 ## What is in this folder
 
 ```
-README.md        this page
-CHANGES.md       what I changed when tidying the original code
+Summary.md        this page
 config.R         file locations and number of simulated years
 run_all.R        runs the scripts in order
 scripts/         the numbered R scripts for the volunteer model
